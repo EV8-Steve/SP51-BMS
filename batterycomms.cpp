@@ -4,7 +4,10 @@
   This module owns Serial1, the WAKE pulse, DIR0 addressing/role setup, the
   previously verified manual base-COMH override, ADC/TSREF preparation, and
   register reads for stack addresses 1..N. It validates UART frames with
-  CRC16-Modbus and advances scans one device at a time.
+  CRC16-Modbus. Scans advance through one asynchronous register transaction
+  at a time so UART waits and ADC conversion waits do not block the main loop.
+  Cell results are read every scan; GPIO/temperature blocks use their own
+  slower configurable interval and cached values between refreshes.
 */
 #include "batterycomms.h"
 
@@ -22,11 +25,19 @@ constexpr uint16_t RESPONSE_TIMEOUT_MS = 200;
 constexpr uint16_t ADC_READY_TIMEOUT_MS = 100;
 constexpr uint16_t RX_QUIET_MS = 4;
 constexpr uint16_t RX_QUIET_MAX_MS = 35;
+// Reuse only a very recent quiet interval already proven after the prior frame.
+constexpr uint16_t QUIET_REUSE_MAX_AGE_MS = 20;
 constexpr uint16_t NO_REPLY_GAP_MS = 5;
 constexpr uint16_t WAKE_PULSE_US = 2500;
 constexpr uint16_t WAKE_PROPAGATION_MS = 250;
 constexpr size_t RX_BUFFER_SIZE = 128;
 constexpr size_t MAX_DATA_BYTES = 32;
+constexpr size_t ASYNC_RESPONSE_SIZE = MAX_DATA_BYTES + 6U;
+
+// Physical balancing remains locked until the fitted resistor wattage and
+// exact CB resistor path are confirmed from the module or its schematic.
+// A 2 x 50-ohm path dissipates about 0.176 W total per cell at 4.2 V.
+constexpr bool BALANCING_HARDWARE_CONFIRMED = false;
 
 // BQ79616 register addresses used by startup and the monitor.
 constexpr uint16_t DEV_CONF = 0x0002;
@@ -38,6 +49,9 @@ constexpr uint16_t ADC_CTRL1 = 0x030D;
 constexpr uint16_t GPIO_CONF1 = 0x000E;
 constexpr uint16_t PARTID = 0x0500;
 constexpr uint16_t ADC_STAT1 = 0x0527;
+constexpr uint16_t BAL_STAT = 0x052B;
+constexpr uint8_t BAL_STAT_INVALID_CBCONF = 0x80U;
+constexpr uint8_t BAL_STAT_CB_RUN = 0x08U;
 constexpr uint16_t TSREF_HI = 0x058C;
 constexpr uint16_t GPIO1_HI = 0x058E;
 constexpr uint16_t VCELL1_HI = 0x0586;
@@ -46,6 +60,8 @@ constexpr uint16_t DEBUG_CTRL_UNLOCK = 0x0700;
 constexpr uint16_t DEBUG_COMM_CTRL1 = 0x0701;
 constexpr uint16_t DEBUG_COMM_CTRL2 = 0x0702;
 constexpr uint16_t OTP_ECC_TEST = 0x034C;
+constexpr uint16_t CB_CELL1_CTRL = 0x0327;
+constexpr uint16_t BAL_CTRL2 = 0x032F;
 
 // Field values used by the established forward DIR0 setup sequence.
 constexpr uint8_t MULTIDROP_EN_MASK = 0x20;
@@ -75,8 +91,89 @@ constexpr float NTC_T0_K = 298.15f;
 uint8_t rxBuffer[RX_BUFFER_SIZE];
 bool communicationReady = false;
 bool scanActive = false;
+void (*backgroundService)() = nullptr;
+uint32_t lastBackgroundServiceAtMs = 0;
 uint8_t configuredStackModules = 0;
 uint8_t scanModuleIndex = 0;
+bool scanTemperatureDue = true;
+bool temperaturePollStarted = false;
+uint32_t lastTemperaturePollAtMs = 0;
+
+struct CachedGpioData {
+  bool valid;
+  uint8_t adcGpioMask;
+  uint8_t validGpioMask;
+  uint8_t ntcEstimateMask;
+  uint16_t gpioRaw[BATTERY_GPIO_COUNT];
+  float gpioMv[BATTERY_GPIO_COUNT];
+  float gpioRatio[BATTERY_GPIO_COUNT];
+  float temperatureC[BATTERY_GPIO_COUNT];
+  float tsrefMv;
+};
+CachedGpioData gpioCache[BATTERY_MAX_STACK_MODULES] = {};
+enum class ScanPhase : uint8_t {
+  ReadAdcControl,
+  ReadAdcStatus,
+  StartAdc,
+  WaitAdcReady,
+  ReadCells,
+  ReadGpio
+};
+ScanPhase scanPhase = ScanPhase::ReadAdcControl;
+uint8_t scanAdcControl = 0;
+uint8_t scanAdcStatus = 0;
+uint8_t scanAdcStartValue = 0;
+uint32_t scanAdcReadyDeadlineMs = 0;
+uint32_t scanAdcNextPollMs = 0;
+
+enum class AsyncState : uint8_t {
+  Idle,
+  WaitTxQuiet,
+  WaitResponse,
+  WaitResponseQuiet,
+  WaitNoReply
+};
+enum class AsyncResult : uint8_t { Inactive, Pending, Success, Failure };
+AsyncState asyncState = AsyncState::Idle;
+uint8_t asyncFrame[7] = {};
+uint8_t asyncResponse[ASYNC_RESPONSE_SIZE] = {};
+size_t asyncFrameLength = 0;
+size_t asyncExpectedLength = 0;
+size_t asyncReceivedLength = 0;
+uint32_t asyncStartedAtMs = 0;
+uint32_t asyncTxAtMs = 0;
+uint32_t asyncLastByteAtMs = 0;
+uint16_t asyncTimeoutMs = RESPONSE_TIMEOUT_MS;
+bool asyncLastByteSeen = false;
+bool asyncUnexpectedByte = false;
+bool uartLineQuietConfirmed = false;
+uint32_t uartLineQuietConfirmedAtMs = 0;
+bool asyncCanSkipTxQuiet = false;
+bool scanTransactionPending = false;
+enum class BalancePhase : uint8_t {
+  Idle,
+  StartTimer,
+  StartGo,
+  VerifyStart,
+  StopTimer,
+  StopGo,
+  VerifyStop
+};
+BalancePhase balancePhase = BalancePhase::Idle;
+bool balanceAsyncPending = false;
+bool balancePulseActive = false;
+bool balanceCandidateValid = false;
+uint8_t balanceAddress = 0;
+uint8_t balanceCell = 0;
+uint8_t balanceCandidateAddress = 0;
+uint8_t balanceCandidateCell = 0;
+uint8_t balanceTimerCode = 0;
+uint16_t balanceCandidateMv = 0;
+uint32_t balancePulseStartedAtMs = 0;
+uint32_t balancePulseMaxOnMs = 10000UL;
+uint32_t balancePulseCoolOffMs = 60000UL;
+uint32_t balanceCoolOffUntilMs = 0;
+char balanceStatusText[64] = "disabled";
 uint8_t gpioConfig[BATTERY_MAX_STACK_MODULES][4] = {};
 uint8_t gpioAdcMasks[BATTERY_MAX_STACK_MODULES] = {};
 bool gpioConfigReady[BATTERY_MAX_STACK_MODULES] = {};
@@ -114,6 +211,22 @@ bool crcValid(const uint8_t *frame, size_t length) {
   return length >= 3 && crc16Modbus(frame, length) == 0;
 }
 
+void serviceBackground() {
+  if (!backgroundService) return;
+  const uint32_t now = millis();
+  if (now - lastBackgroundServiceAtMs < 1U) return;
+  lastBackgroundServiceAtMs = now;
+  backgroundService();
+}
+
+void cooperativeDelay(uint16_t durationMs) {
+  const uint32_t started = millis();
+  while (millis() - started < durationMs) {
+    serviceBackground();
+    delay(1);
+  }
+}
+
 void drainRx() {
   while (Serial1.available()) {
     if (Serial1.read() < 0) break;
@@ -129,11 +242,13 @@ void waitForRxQuietAndDrain() {
       if (Serial1.read() < 0) continue;
       lastByteAt = millis();
     }
+    serviceBackground();
     delayMicroseconds(100);
   }
 }
 
 bool prepareTx() {
+  uartLineQuietConfirmed = false;
   drainRx();
   waitForRxQuietAndDrain();
   return true;
@@ -144,7 +259,7 @@ bool sendNoReply(const uint8_t *frame, size_t length) {
   prepareTx();
   if (Serial1.write(frame, length) != length) return false;
   Serial1.flush();
-  delay(NO_REPLY_GAP_MS);
+  cooperativeDelay(NO_REPLY_GAP_MS);
   waitForRxQuietAndDrain();
   return true;
 }
@@ -168,6 +283,7 @@ bool sendAndReceive(const uint8_t *frame, size_t frameLength,
       const int byteValue = Serial1.read();
       if (byteValue >= 0) response[received++] = static_cast<uint8_t>(byteValue);
     }
+    serviceBackground();
     if (received < expectedBytes) delayMicroseconds(100);
   }
 
@@ -227,6 +343,169 @@ bool readRegister(uint8_t address, uint16_t reg, uint8_t &value) {
   return readBlock(address, reg, 1, &value);
 }
 
+bool beginAsyncRequest(const uint8_t *frame, size_t frameLength,
+                       size_t expectedLength, uint16_t timeoutMs) {
+  if (!frame || !frameLength || frameLength > sizeof(asyncFrame) ||
+      expectedLength > sizeof(asyncResponse) || asyncState != AsyncState::Idle) {
+    return false;
+  }
+  memcpy(asyncFrame, frame, frameLength);
+  asyncFrameLength = frameLength;
+  asyncExpectedLength = expectedLength;
+  asyncReceivedLength = 0;
+  asyncTimeoutMs = timeoutMs;
+  asyncStartedAtMs = millis();
+  asyncCanSkipTxQuiet = uartLineQuietConfirmed &&
+      asyncStartedAtMs - uartLineQuietConfirmedAtMs <=
+          QUIET_REUSE_MAX_AGE_MS &&
+      Serial1.available() == 0;
+  uartLineQuietConfirmed = false;
+  asyncTxAtMs = 0;
+  asyncLastByteAtMs = 0;
+  asyncLastByteSeen = false;
+  asyncUnexpectedByte = false;
+  asyncState = AsyncState::WaitTxQuiet;
+  return true;
+}
+
+bool beginAsyncRead(uint8_t address, uint16_t reg, uint8_t dataLength) {
+  if (!dataLength || dataLength > MAX_DATA_BYTES) return false;
+  uint8_t frame[7] = {CMD_SINGLE_READ, address,
+                      static_cast<uint8_t>(reg >> 8),
+                      static_cast<uint8_t>(reg & 0xFFU),
+                      static_cast<uint8_t>(dataLength - 1U), 0, 0};
+  appendCrc(frame, 5);
+  return beginAsyncRequest(frame, sizeof(frame),
+                           static_cast<size_t>(dataLength) + 6U,
+                           RESPONSE_TIMEOUT_MS);
+}
+
+bool beginAsyncWrite(uint8_t address, uint16_t reg, uint8_t value) {
+  uint8_t frame[7] = {CMD_SINGLE_WRITE, address,
+                      static_cast<uint8_t>(reg >> 8),
+                      static_cast<uint8_t>(reg & 0xFFU), value, 0, 0};
+  appendCrc(frame, 5);
+  return beginAsyncRequest(frame, sizeof(frame), 0U, NO_REPLY_GAP_MS);
+}
+
+AsyncResult finishAsync(bool success) {
+  const uint32_t now = millis();
+  bool lineQuiet = false;
+  if (success && asyncState == AsyncState::WaitResponseQuiet) {
+    lineQuiet = true;  // This state finishes only after a full quiet interval.
+  } else if (success && asyncState == AsyncState::WaitNoReply) {
+    lineQuiet = asyncLastByteSeen
+        ? now - asyncLastByteAtMs >= RX_QUIET_MS
+        : now - asyncTxAtMs >= RX_QUIET_MS;
+  }
+  uartLineQuietConfirmed = lineQuiet;
+  if (lineQuiet) uartLineQuietConfirmedAtMs = now;
+  asyncState = AsyncState::Idle;
+  return success ? AsyncResult::Success : AsyncResult::Failure;
+}
+
+AsyncResult pollAsyncRequest() {
+  if (asyncState == AsyncState::Idle) return AsyncResult::Inactive;
+
+  uint32_t now = millis();
+  if (asyncState == AsyncState::WaitTxQuiet) {
+    while (Serial1.available()) {
+      if (Serial1.read() >= 0) {
+        asyncLastByteAtMs = millis();
+        asyncLastByteSeen = true;
+        asyncCanSkipTxQuiet = false;
+      }
+    }
+    now = millis();
+    const bool quiet = asyncCanSkipTxQuiet
+        ? true
+        : (asyncLastByteSeen
+        ? now - asyncLastByteAtMs >= RX_QUIET_MS
+        : now - asyncStartedAtMs >= RX_QUIET_MS);
+    if (!quiet && now - asyncStartedAtMs < RX_QUIET_MAX_MS) {
+      return AsyncResult::Pending;
+    }
+    if (Serial1.write(asyncFrame, asyncFrameLength) != asyncFrameLength) {
+      return finishAsync(false);
+    }
+    asyncTxAtMs = millis();
+    asyncState = asyncExpectedLength ? AsyncState::WaitResponse
+                                     : AsyncState::WaitNoReply;
+    return AsyncResult::Pending;
+  }
+
+  if (asyncState == AsyncState::WaitResponse) {
+    while (Serial1.available()) {
+      const int byteValue = Serial1.read();
+      if (byteValue < 0) continue;
+      asyncLastByteAtMs = millis();
+      asyncLastByteSeen = true;
+      if (asyncReceivedLength < asyncExpectedLength) {
+        asyncResponse[asyncReceivedLength++] = static_cast<uint8_t>(byteValue);
+      } else {
+        asyncUnexpectedByte = true;
+      }
+    }
+    if (asyncReceivedLength == asyncExpectedLength) {
+      asyncState = AsyncState::WaitResponseQuiet;
+      return AsyncResult::Pending;
+    }
+    if (millis() - asyncTxAtMs >= asyncTimeoutMs) {
+      return finishAsync(false);
+    }
+    return AsyncResult::Pending;
+  }
+
+  if (asyncState == AsyncState::WaitResponseQuiet) {
+    while (Serial1.available()) {
+      if (Serial1.read() >= 0) {
+        asyncLastByteAtMs = millis();
+        asyncLastByteSeen = true;
+        asyncUnexpectedByte = true;
+      }
+    }
+    now = millis();
+    if (asyncLastByteSeen && now - asyncLastByteAtMs >= RX_QUIET_MS) {
+      return finishAsync(!asyncUnexpectedByte);
+    }
+    if (now - asyncTxAtMs >= asyncTimeoutMs) return finishAsync(false);
+    return AsyncResult::Pending;
+  }
+
+  // Single writes have no response. Observe the minimum inter-frame gap and a
+  // short RX-quiet interval without making the main loop wait.
+  while (Serial1.available()) {
+    if (Serial1.read() >= 0) {
+      asyncLastByteAtMs = millis();
+      asyncLastByteSeen = true;
+    }
+  }
+  now = millis();
+  const bool quiet = asyncLastByteSeen
+      ? now - asyncLastByteAtMs >= RX_QUIET_MS
+      : now - asyncTxAtMs >= RX_QUIET_MS;
+  if (now - asyncTxAtMs >= asyncTimeoutMs && quiet) {
+    return finishAsync(true);
+  }
+  if (now - asyncTxAtMs >= RX_QUIET_MAX_MS) return finishAsync(true);
+  return AsyncResult::Pending;
+}
+
+bool asyncReadPayload(uint8_t address, uint16_t reg, uint8_t dataLength,
+                      const uint8_t *&payload) {
+  const size_t responseLength = static_cast<size_t>(dataLength) + 6U;
+  if (!dataLength || asyncReceivedLength != responseLength ||
+      asyncResponse[0] != static_cast<uint8_t>(dataLength - 1U) ||
+      asyncResponse[1] != address ||
+      asyncResponse[2] != static_cast<uint8_t>(reg >> 8) ||
+      asyncResponse[3] != static_cast<uint8_t>(reg & 0xFFU) ||
+      !crcValid(asyncResponse, responseLength)) {
+    return false;
+  }
+  payload = &asyncResponse[4];
+  return true;
+}
+
 bool dummyBroadcastRead(uint8_t totalDevices) {
   // TI DLL synchronization/readback step. Validate every expected response
   // frame and address before declaring the daisy-chain link ready.
@@ -272,10 +551,10 @@ void wakeBase() {
   digitalWrite(BQ_TX_PIN, LOW);
   delayMicroseconds(WAKE_PULSE_US);
   digitalWrite(BQ_TX_PIN, HIGH);
-  delay(12);
+  cooperativeDelay(12);
   pinMode(BQ_TX_PIN, INPUT_PULLUP);
   Serial1.begin(BQ_BAUD);
-  delay(100);
+  cooperativeDelay(100);
   drainRx();
 }
 
@@ -292,7 +571,7 @@ bool ensureDaisyMode(bool &changed) {
       setLastError("could not clear DEV_CONF.MULTIDROP_EN");
       return false;
     }
-    delay(2);
+    cooperativeDelay(2);
     uint8_t verify = 0;
     if (!readRegister(BASE_ADDRESS, DEV_CONF, verify) ||
         (verify & MULTIDROP_EN_MASK)) {
@@ -393,41 +672,13 @@ bool cacheGpioConfigAndEnableTsref(uint8_t moduleIndex,
   if (!(control2 & TSREF_EN)) {
     // CONTROL2 bit 1 is SEND_HW_RESET. Write only TSREF_EN, keeping reset low.
     if (!writeRegister(address, CONTROL2, TSREF_EN)) return false;
-    delay(2);  // TI requires at least 1.35 ms TSREF startup time.
+    cooperativeDelay(2);  // TI requires at least 1.35 ms TSREF startup time.
     if (!readRegister(address, CONTROL2, control2) || !(control2 & TSREF_EN)) {
       return false;
     }
   }
   tsrefReady[moduleIndex] = true;
   return true;
-}
-
-bool configureAdcReady(uint8_t address) {
-  // Start a one-shot 8RR conversion only when the ADC is stopped or already in
-  // 8RR mode. Existing continuous mode is left running; other modes are rejected.
-  uint8_t control = 0;
-  uint8_t status = 0;
-  if (!readRegister(address, ADC_CTRL1, control) ||
-      !readRegister(address, ADC_STAT1, status)) {
-    return false;
-  }
-
-  const uint8_t mode = control & ADC_MODE_MASK;
-  if (mode == 0 || mode == ADC_MODE_8RR) {
-    const uint8_t startValue = static_cast<uint8_t>(
-        (control & 0x18U) | ADC_MODE_8RR | ADC_GO);
-    if (!writeRegister(address, ADC_CTRL1, startValue)) return false;
-    status &= static_cast<uint8_t>(~ADC_READY);
-  } else if (mode != ADC_MODE_CONTINUOUS) {
-    return false;
-  }
-
-  const uint32_t started = millis();
-  while (!(status & ADC_READY) && millis() - started < ADC_READY_TIMEOUT_MS) {
-    delay(2);
-    if (!readRegister(address, ADC_STAT1, status)) return false;
-  }
-  return (status & ADC_READY) != 0;
 }
 
 int32_t signedAdcCounts(uint16_t raw) {
@@ -441,13 +692,12 @@ void setModuleError(ModuleReading &module, const char *message) {
   }
 }
 
-bool readCellResults(uint8_t address, ModuleReading &module) {
-  // Read the twelve adjacent HI/LO cell-result pairs in one block and convert
-  // signed ADC counts to millivolts. 0x8000 is the BQ invalid-result sentinel.
+bool parseCellResults(const uint8_t *data, ModuleReading &module) {
+  // Convert the twelve adjacent HI/LO cell-result pairs to millivolts.
+  // 0x8000 is the BQ invalid-result sentinel.
   constexpr uint16_t FIRST_CELL_HI = VCELL1_HI - 2U * (BATTERY_CELLS_PER_MODULE - 1U);
-  constexpr uint8_t CELL_DATA_BYTES = 2U * BATTERY_CELLS_PER_MODULE;
-  uint8_t data[CELL_DATA_BYTES] = {};
-  if (!readBlock(address, FIRST_CELL_HI, CELL_DATA_BYTES, data)) return false;
+  (void)FIRST_CELL_HI;
+  if (!data) return false;
 
   module.minCellMv = 1000000.0f;
   module.maxCellMv = -1000000.0f;
@@ -472,18 +722,18 @@ bool readCellResults(uint8_t address, ModuleReading &module) {
   return module.validCellCount == BATTERY_CELLS_PER_MODULE;
 }
 
-bool readGpioResults(uint8_t moduleIndex, uint8_t address,
-                     const BmsSettings &settings, ModuleReading &module) {
-  // Read TSREF and all GPIO result pairs as one register block, then derive
-  // GPIO volts and (for enabled NTC modes) provisional temperatures.
+bool parseGpioResults(uint8_t moduleIndex, const BmsSettings &settings,
+                      ModuleReading &module, const uint8_t *data) {
+  // Derive GPIO volts and (for enabled NTC modes) provisional temperatures
+  // from the already-read TSREF and GPIO result block.
   module.adcGpioMask = gpioAdcMasks[moduleIndex];
   if (!gpioConfigReady[moduleIndex]) return false;
-  if (!module.adcGpioMask) return true;
+  if (!module.adcGpioMask) {
+    module.gpioDataFresh = true;
+    return true;
+  }
   if (!tsrefReady[moduleIndex]) return false;
-
-  constexpr uint8_t RESULT_BYTES = 18;  // TSREF plus GPIO1..GPIO8, HI/LO.
-  uint8_t data[RESULT_BYTES] = {};
-  if (!readBlock(address, TSREF_HI, RESULT_BYTES, data)) return false;
+  if (!data) return false;
 
   const uint16_t tsrefRaw = static_cast<uint16_t>(
       (static_cast<uint16_t>(data[0]) << 8) | data[1]);
@@ -529,28 +779,495 @@ bool readGpioResults(uint8_t moduleIndex, uint8_t address,
       }
     }
   }
+  module.gpioDataFresh = allConfiguredChannelsValid;
   return allConfiguredChannelsValid;
 }
 
-void readOneModule(uint8_t moduleIndex, const BmsSettings &settings,
-                   ModuleReading &module) {
-  // Finish one device's ADC status, cell block and configured GPIO/TSREF block
-  // before advancing the scan to the next stack address.
-  module.address = static_cast<uint8_t>(moduleIndex + 1U);
-  module.cellReadOk = false;
-  module.gpioReadOk = false;
-  module.error[0] = '\0';
+void loadCachedGpioData(uint8_t moduleIndex, ModuleReading &module) {
+  const CachedGpioData &cached = gpioCache[moduleIndex];
+  module.adcGpioMask = cached.adcGpioMask;
+  module.validGpioMask = cached.validGpioMask;
+  module.ntcEstimateMask = cached.ntcEstimateMask;
+  memcpy(module.gpioRaw, cached.gpioRaw, sizeof(module.gpioRaw));
+  memcpy(module.gpioMv, cached.gpioMv, sizeof(module.gpioMv));
+  memcpy(module.gpioRatio, cached.gpioRatio, sizeof(module.gpioRatio));
+  memcpy(module.temperatureC, cached.temperatureC,
+         sizeof(module.temperatureC));
+  module.tsrefMv = cached.tsrefMv;
+  module.gpioReadOk = cached.valid;
+  module.gpioDataFresh = false;
+}
 
-  if (!configureAdcReady(module.address)) {
-    setModuleError(module, "main ADC not ready or control/status read failed");
-    return;
+void saveCachedGpioData(uint8_t moduleIndex, const ModuleReading &module) {
+  CachedGpioData &cached = gpioCache[moduleIndex];
+  cached.valid = module.gpioReadOk;
+  cached.adcGpioMask = module.adcGpioMask;
+  cached.validGpioMask = module.validGpioMask;
+  cached.ntcEstimateMask = module.ntcEstimateMask;
+  memcpy(cached.gpioRaw, module.gpioRaw, sizeof(module.gpioRaw));
+  memcpy(cached.gpioMv, module.gpioMv, sizeof(module.gpioMv));
+  memcpy(cached.gpioRatio, module.gpioRatio, sizeof(module.gpioRatio));
+  memcpy(cached.temperatureC, module.temperatureC,
+         sizeof(module.temperatureC));
+  cached.tsrefMv = module.tsrefMv;
+}
+
+void initializeScanModule(BatterySnapshot &snapshot) {
+  if (scanModuleIndex >= snapshot.moduleCount) return;
+  ModuleReading &module = snapshot.modules[scanModuleIndex];
+  module.address = static_cast<uint8_t>(scanModuleIndex + 1U);
+  module.cellReadOk = false;
+  module.gpioReadOk = scanTemperatureDue
+      ? false : gpioCache[scanModuleIndex].valid;
+  module.gpioDataFresh = false;
+  module.validCellCount = 0;
+  if (scanTemperatureDue) {
+    module.adcGpioMask = 0;
+    module.validGpioMask = 0;
+    module.ntcEstimateMask = 0;
+  }
+  module.error[0] = '\0';
+  scanAdcControl = 0;
+  scanAdcStatus = 0;
+  scanPhase = ScanPhase::ReadAdcControl;
+}
+
+BatteryScanStepResult finishScanModule(BatterySnapshot &snapshot) {
+  ModuleReading &module = snapshot.modules[scanModuleIndex];
+  if (scanTemperatureDue) {
+    if (module.gpioReadOk) {
+      saveCachedGpioData(scanModuleIndex, module);
+    } else if (gpioCache[scanModuleIndex].valid) {
+      // Keep the last usable values visible if this slower refresh fails,
+      // while preserving the failed-read flag for this scan.
+      loadCachedGpioData(scanModuleIndex, module);
+      module.gpioReadOk = false;
+    }
+  } else {
+    module.gpioReadOk = gpioCache[scanModuleIndex].valid;
+    module.gpioDataFresh = false;
+  }
+  snapshot.validCellCount = static_cast<uint16_t>(
+      snapshot.validCellCount + module.validCellCount);
+  if (!module.cellReadOk) snapshot.allCellReadsOk = false;
+  if (!module.gpioReadOk) snapshot.allGpioReadsOk = false;
+  ++snapshot.completedModules;
+  ++scanModuleIndex;
+  scanTransactionPending = false;
+
+  if (scanModuleIndex >= snapshot.moduleCount) {
+    snapshot.finishedAtMs = millis();
+    snapshot.durationMs = snapshot.finishedAtMs - snapshot.startedAtMs;
+    scanActive = false;
+    return BatteryScanStepResult::Complete;
   }
 
-  module.cellReadOk = readCellResults(module.address, module);
-  if (!module.cellReadOk) setModuleError(module, "cell ADC block read incomplete");
+  initializeScanModule(snapshot);
+  return BatteryScanStepResult::InProgress;
+}
 
-  module.gpioReadOk = readGpioResults(moduleIndex, module.address, settings, module);
-  if (!module.gpioReadOk) setModuleError(module, "GPIO/TSREF ADC read incomplete");
+BatteryScanStepResult failScanOperation(BatterySnapshot &snapshot,
+                                        const char *detail = nullptr) {
+  ModuleReading &module = snapshot.modules[scanModuleIndex];
+  scanTransactionPending = false;
+  if (scanPhase == ScanPhase::ReadCells) {
+    module.cellReadOk = false;
+    setModuleError(module, "cell ADC block read incomplete");
+    scanPhase = ScanPhase::ReadGpio;
+    return BatteryScanStepResult::InProgress;
+  }
+  if (scanPhase == ScanPhase::ReadGpio) {
+    module.gpioReadOk = false;
+    setModuleError(module, "GPIO/TSREF ADC read incomplete");
+    return finishScanModule(snapshot);
+  }
+
+  if (detail) {
+    setModuleError(module, detail);
+  } else {
+    switch (scanPhase) {
+      case ScanPhase::ReadAdcControl:
+        setModuleError(module, "ADC_CTRL1 read/response failed");
+        break;
+      case ScanPhase::ReadAdcStatus:
+        setModuleError(module, "ADC_STAT1 read/response failed");
+        break;
+      case ScanPhase::StartAdc:
+        setModuleError(module, "ADC_CTRL1 start write failed");
+        break;
+      case ScanPhase::WaitAdcReady:
+        setModuleError(module, "ADC_STAT1 read/ADC_READY failed");
+        break;
+      case ScanPhase::ReadCells:
+      case ScanPhase::ReadGpio:
+        setModuleError(module, "unexpected ADC scan phase failure");
+        break;
+    }
+  }
+  return finishScanModule(snapshot);
+}
+
+bool launchScanOperation(ModuleReading &module, uint8_t moduleIndex,
+                         const BmsSettings &settings) {
+  if (scanPhase == ScanPhase::WaitAdcReady &&
+      static_cast<int32_t>(millis() - scanAdcNextPollMs) < 0) {
+    return true;  // Waiting between ADC status polls is not a failure.
+  }
+
+  bool started = false;
+  switch (scanPhase) {
+    case ScanPhase::ReadAdcControl:
+      started = beginAsyncRead(module.address, ADC_CTRL1, 1);
+      break;
+    case ScanPhase::ReadAdcStatus:
+    case ScanPhase::WaitAdcReady:
+      started = beginAsyncRead(module.address, ADC_STAT1, 1);
+      break;
+    case ScanPhase::StartAdc:
+      started = beginAsyncWrite(module.address, ADC_CTRL1, scanAdcStartValue);
+      break;
+    case ScanPhase::ReadCells:
+      started = beginAsyncRead(module.address,
+          static_cast<uint16_t>(VCELL1_HI -
+              2U * (BATTERY_CELLS_PER_MODULE - 1U)),
+          static_cast<uint8_t>(2U * BATTERY_CELLS_PER_MODULE));
+      break;
+    case ScanPhase::ReadGpio:
+      module.adcGpioMask = gpioAdcMasks[moduleIndex];
+      if (!gpioConfigReady[moduleIndex] ||
+          (module.adcGpioMask && !tsrefReady[moduleIndex])) {
+        return false;
+      }
+      if (!module.adcGpioMask) return true;
+      started = beginAsyncRead(module.address, TSREF_HI, 18);
+      break;
+  }
+
+  if (started) scanTransactionPending = true;
+  return started;
+}
+
+BatteryScanStepResult scanStepInternal(BatterySnapshot &snapshot,
+                                       const BmsSettings &settings) {
+  // This state machine starts or services one UART transaction per call.
+  // Receive waits and ADC conversion waits are timer-driven, so CAN and BMS
+  // supervision continue to run while a BQ reply or conversion is pending.
+  if (!communicationReady || !scanActive) return BatteryScanStepResult::NotReady;
+
+  ModuleReading &module = snapshot.modules[scanModuleIndex];
+  if (!scanTransactionPending) {
+    if (scanPhase == ScanPhase::ReadGpio && !scanTemperatureDue) {
+      module.gpioReadOk = gpioCache[scanModuleIndex].valid;
+      module.gpioDataFresh = false;
+      if (!module.gpioReadOk) {
+        setModuleError(module, "no cached GPIO/TSREF ADC data");
+      }
+      return finishScanModule(snapshot);
+    }
+    if (scanPhase == ScanPhase::ReadGpio &&
+        gpioConfigReady[scanModuleIndex] &&
+        gpioAdcMasks[scanModuleIndex] == 0U) {
+      module.adcGpioMask = 0;
+      module.gpioReadOk = parseGpioResults(scanModuleIndex, settings, module,
+                                           nullptr);
+      if (!module.gpioReadOk) setModuleError(module, "GPIO/TSREF ADC read incomplete");
+      return finishScanModule(snapshot);
+    }
+    if (!launchScanOperation(module, scanModuleIndex, settings)) {
+      return failScanOperation(snapshot);
+    }
+    return BatteryScanStepResult::InProgress;
+  }
+
+  const AsyncResult io = pollAsyncRequest();
+  if (io == AsyncResult::Pending) return BatteryScanStepResult::InProgress;
+  scanTransactionPending = false;
+  if (io != AsyncResult::Success) return failScanOperation(snapshot);
+
+  const uint8_t *payload = nullptr;
+  switch (scanPhase) {
+    case ScanPhase::ReadAdcControl:
+      if (!asyncReadPayload(module.address, ADC_CTRL1, 1, payload)) {
+        return failScanOperation(snapshot);
+      }
+      scanAdcControl = payload[0];
+      scanPhase = ScanPhase::ReadAdcStatus;
+      break;
+
+    case ScanPhase::ReadAdcStatus: {
+      if (!asyncReadPayload(module.address, ADC_STAT1, 1, payload)) {
+        return failScanOperation(snapshot);
+      }
+      scanAdcStatus = payload[0];
+      const uint8_t mode = scanAdcControl & ADC_MODE_MASK;
+      if (mode == 0 || mode == ADC_MODE_8RR) {
+        scanAdcStartValue = static_cast<uint8_t>(
+            (scanAdcControl & 0x18U) | ADC_MODE_8RR | ADC_GO);
+        scanPhase = ScanPhase::StartAdc;
+      } else if (mode == ADC_MODE_CONTINUOUS) {
+        if (scanAdcStatus & ADC_READY) {
+          scanPhase = ScanPhase::ReadCells;
+        } else {
+          scanAdcReadyDeadlineMs = millis() + ADC_READY_TIMEOUT_MS;
+          scanAdcNextPollMs = millis() + 2U;
+          scanPhase = ScanPhase::WaitAdcReady;
+        }
+      } else {
+        return failScanOperation(snapshot, "unsupported ADC_CTRL1 mode");
+      }
+      break;
+    }
+
+    case ScanPhase::StartAdc:
+      scanAdcReadyDeadlineMs = millis() + ADC_READY_TIMEOUT_MS;
+      scanAdcNextPollMs = millis() + 2U;
+      scanPhase = ScanPhase::WaitAdcReady;
+      break;
+
+    case ScanPhase::WaitAdcReady:
+      if (!asyncReadPayload(module.address, ADC_STAT1, 1, payload)) {
+        return failScanOperation(snapshot);
+      }
+      scanAdcStatus = payload[0];
+      if (scanAdcStatus & ADC_READY) {
+        scanPhase = ScanPhase::ReadCells;
+      } else if (static_cast<int32_t>(millis() - scanAdcReadyDeadlineMs) >= 0) {
+        return failScanOperation(snapshot,
+                                 "ADC_READY timeout after 100 ms");
+      } else {
+        scanAdcNextPollMs = millis() + 2U;
+      }
+      break;
+
+    case ScanPhase::ReadCells:
+      if (!asyncReadPayload(module.address,
+              static_cast<uint16_t>(VCELL1_HI -
+                  2U * (BATTERY_CELLS_PER_MODULE - 1U)),
+              static_cast<uint8_t>(2U * BATTERY_CELLS_PER_MODULE), payload)) {
+        return failScanOperation(snapshot);
+      }
+      module.cellReadOk = parseCellResults(payload, module);
+      if (!module.cellReadOk) setModuleError(module, "cell ADC block read incomplete");
+      scanPhase = ScanPhase::ReadGpio;
+      break;
+
+    case ScanPhase::ReadGpio:
+      if (module.adcGpioMask) {
+        if (!asyncReadPayload(module.address, TSREF_HI, 18, payload)) {
+          return failScanOperation(snapshot);
+        }
+      }
+      module.gpioReadOk = parseGpioResults(scanModuleIndex, settings, module,
+                                           module.adcGpioMask ? payload : nullptr);
+      if (!module.gpioReadOk) setModuleError(module, "GPIO/TSREF ADC read incomplete");
+      return finishScanModule(snapshot);
+  }
+  return BatteryScanStepResult::InProgress;
+}
+
+void setBalanceStatus(const char *message) {
+  copyText(balanceStatusText, sizeof(balanceStatusText), message);
+}
+
+uint8_t balanceTimerEncoding(uint16_t seconds) {
+  // TI CB_CELLx_CTRL timer encodings: 1=10 s, 2=30 s, 3=60 s.
+  if (seconds == 30U) return 0x02U;
+  if (seconds == 60U) return 0x03U;
+  return 0x01U;
+}
+
+uint16_t effectiveBalanceOnSeconds(const BmsSettings &settings) {
+  uint16_t seconds = settings.balancingMaxOnSeconds;
+  if (settings.balancingConservativeLevel >= 1U && seconds > 30U) {
+    seconds = 30U;
+  }
+  if (settings.balancingConservativeLevel >= 2U && seconds > 10U) {
+    seconds = 10U;
+  }
+  return seconds;
+}
+
+uint32_t effectiveBalanceCoolOffMs(const BmsSettings &settings) {
+  const uint8_t multiplier = settings.balancingConservativeLevel == 2U
+      ? 4U : (settings.balancingConservativeLevel == 1U ? 2U : 1U);
+  return settings.balancingCoolOffMs * multiplier;
+}
+
+uint16_t balanceCellControlRegister(uint8_t cell) {
+  // CB_CELL1_CTRL is the highest register; subsequent cells descend by one.
+  return static_cast<uint16_t>(CB_CELL1_CTRL - (cell - 1U));
+}
+
+bool beginBalanceWrite(uint16_t reg, uint8_t value) {
+  if (!beginAsyncWrite(balanceAddress, reg, value)) return false;
+  balanceAsyncPending = true;
+  return true;
+}
+
+bool beginBalanceReadStatus() {
+  if (!beginAsyncRead(balanceAddress, BAL_STAT, 1U)) return false;
+  balanceAsyncPending = true;
+  return true;
+}
+
+void failBalanceSequence() {
+  balanceAsyncPending = false;
+  balancePhase = BalancePhase::Idle;
+  balancePulseActive = false;
+  balanceCoolOffUntilMs = millis() + balancePulseCoolOffMs;
+  setLastError("cell-balancing command/status verification failed");
+  setBalanceStatus("ERROR: balancing command/status");
+}
+
+bool serviceBalanceSequence(const BmsSettings &settings, bool permitted) {
+  const uint32_t now = millis();
+  if (balanceAsyncPending) {
+    const AsyncResult result = pollAsyncRequest();
+    if (result == AsyncResult::Pending) return true;
+    balanceAsyncPending = false;
+    if (result != AsyncResult::Success) {
+      failBalanceSequence();
+      return false;
+    }
+    switch (balancePhase) {
+      case BalancePhase::StartTimer:
+        balancePhase = BalancePhase::StartGo;
+        break;
+      case BalancePhase::StartGo:
+        balancePhase = BalancePhase::VerifyStart;
+        break;
+      case BalancePhase::VerifyStart: {
+        const uint8_t *payload = nullptr;
+        if (!asyncReadPayload(balanceAddress, BAL_STAT, 1U, payload) ||
+            (payload[0] & BAL_STAT_INVALID_CBCONF) ||
+            !(payload[0] & BAL_STAT_CB_RUN)) {
+          failBalanceSequence();
+          return false;
+        }
+        balancePhase = BalancePhase::Idle;
+        balancePulseActive = true;
+        balancePulseStartedAtMs = now;
+        snprintf(balanceStatusText, sizeof(balanceStatusText),
+                 "ACTIVE: addr %u cell %u",
+                 static_cast<unsigned>(balanceAddress),
+                 static_cast<unsigned>(balanceCell));
+        break;
+      }
+      case BalancePhase::StopTimer:
+        balancePhase = BalancePhase::StopGo;
+        break;
+      case BalancePhase::StopGo:
+        balancePhase = BalancePhase::VerifyStop;
+        break;
+      case BalancePhase::VerifyStop: {
+        const uint8_t *payload = nullptr;
+        if (!asyncReadPayload(balanceAddress, BAL_STAT, 1U, payload) ||
+            (payload[0] & BAL_STAT_CB_RUN)) {
+          failBalanceSequence();
+          return false;
+        }
+        balancePhase = BalancePhase::Idle;
+        balancePulseActive = false;
+        balanceCoolOffUntilMs = now + balancePulseCoolOffMs;
+        setBalanceStatus("COOLING after balance pulse");
+        break;
+      }
+      case BalancePhase::Idle:
+        break;
+    }
+    return false;
+  }
+
+  if (balancePhase != BalancePhase::Idle) {
+    if (balancePhase == BalancePhase::StartGo &&
+        (!settings.cellBalancingEnabled || !permitted)) {
+      // Do not start the timed CBFET after interlocks changed while the timer
+      // register write was being sent.
+      balancePhase = BalancePhase::StopTimer;
+    }
+
+    uint16_t reg = BAL_CTRL2;
+    uint8_t value = 0x22U;  // FLTSTOP_EN plus BAL_GO; AUTO_BAL remains clear.
+    switch (balancePhase) {
+      case BalancePhase::StartTimer:
+        reg = balanceCellControlRegister(balanceCell);
+        value = balanceTimerCode;
+        setBalanceStatus("STARTING timed balance pulse");
+        break;
+      case BalancePhase::StopTimer:
+        reg = balanceCellControlRegister(balanceCell);
+        value = 0x00U;
+        setBalanceStatus("STOPPING balance pulse");
+        break;
+      case BalancePhase::StartGo:
+        setBalanceStatus("STARTING timed balance pulse");
+        break;
+      case BalancePhase::VerifyStart:
+        setBalanceStatus("VERIFYING BQ balance status");
+        if (!beginBalanceReadStatus()) {
+          failBalanceSequence();
+          return false;
+        }
+        return true;
+      case BalancePhase::StopGo:
+        setBalanceStatus("STOPPING balance pulse");
+        break;
+      case BalancePhase::VerifyStop:
+        setBalanceStatus("VERIFYING balance stopped");
+        if (!beginBalanceReadStatus()) {
+          failBalanceSequence();
+          return false;
+        }
+        return true;
+      case BalancePhase::Idle:
+        return false;
+    }
+    if (!beginBalanceWrite(reg, value)) {
+      failBalanceSequence();
+      return false;
+    }
+    return true;
+  }
+
+  if (balancePulseActive) {
+    if (!settings.cellBalancingEnabled || !permitted ||
+        now - balancePulseStartedAtMs >= balancePulseMaxOnMs) {
+      balancePhase = BalancePhase::StopTimer;
+      setBalanceStatus("STOPPING balance pulse");
+      return false;
+    }
+    snprintf(balanceStatusText, sizeof(balanceStatusText),
+             "ACTIVE: addr %u cell %u",
+             static_cast<unsigned>(balanceAddress),
+             static_cast<unsigned>(balanceCell));
+    return false;
+  }
+
+  if (!settings.cellBalancingEnabled) {
+    setBalanceStatus("disabled in settings");
+    return false;
+  }
+  if (!permitted) {
+    setBalanceStatus("inhibited by BMS state/interlocks");
+    return false;
+  }
+  if (!balanceCandidateValid) {
+    setBalanceStatus("target met; no candidate cell");
+    return false;
+  }
+  if (static_cast<int32_t>(now - balanceCoolOffUntilMs) < 0) {
+    setBalanceStatus("COOLING after balance pulse");
+    return false;
+  }
+
+  balanceAddress = balanceCandidateAddress;
+  balanceCell = balanceCandidateCell;
+  const uint16_t effectiveOnSeconds = effectiveBalanceOnSeconds(settings);
+  balanceTimerCode = balanceTimerEncoding(effectiveOnSeconds);
+  balancePulseMaxOnMs = static_cast<uint32_t>(effectiveOnSeconds) * 1000UL;
+  balancePulseCoolOffMs = effectiveBalanceCoolOffMs(settings);
+  balancePhase = BalancePhase::StartTimer;
+  return serviceBalanceSequence(settings, permitted);
 }
 
 bool initializationFailed(char *error, size_t errorSize, const char *message) {
@@ -562,10 +1279,28 @@ bool initializationFailed(char *error, size_t errorSize, const char *message) {
 }
 }
 
+BatteryScanStepResult batteryCommsScanStep(BatterySnapshot &snapshot,
+                                           const BmsSettings &settings) {
+  return scanStepInternal(snapshot, settings);
+}
+
 bool batteryCommsBegin(const BmsSettings &settings, char *error,
                        size_t errorSize) {
   communicationReady = false;
   scanActive = false;
+  scanTransactionPending = false;
+  asyncState = AsyncState::Idle;
+  balancePhase = BalancePhase::Idle;
+  balanceAsyncPending = false;
+  balancePulseActive = false;
+  balanceCandidateValid = false;
+  setBalanceStatus("waiting for a valid full-stack scan");
+  uartLineQuietConfirmed = false;
+  asyncCanSkipTxQuiet = false;
+  scanTemperatureDue = true;
+  temperaturePollStarted = false;
+  lastTemperaturePollAtMs = 0U;
+  memset(gpioCache, 0, sizeof(gpioCache));
   memset(gpioConfig, 0, sizeof(gpioConfig));
   memset(gpioAdcMasks, 0, sizeof(gpioAdcMasks));
   memset(gpioConfigReady, 0, sizeof(gpioConfigReady));
@@ -581,9 +1316,9 @@ bool batteryCommsBegin(const BmsSettings &settings, char *error,
   // Follow the hardware-verified startup order: WAKE, addresses/roles, manual
   // COMH override, then DEV_CONF and stack-response verification.
   Serial1.begin(BQ_BAUD);
-  delay(100);
+  cooperativeDelay(100);
   wakeBase();
-  delay(WAKE_PROPAGATION_MS);
+  cooperativeDelay(WAKE_PROPAGATION_MS);
 
   if (!configureAddressesAndRoles(configuredStackModules)) {
     return initializationFailed(error, errorSize, lastError);
@@ -624,7 +1359,7 @@ bool batteryCommsBegin(const BmsSettings &settings, char *error,
   }
 
   // Cache channel configuration and leave TSREF enabled on ADC-configured
-  // stack modules so the 500 ms monitor can sample GPIO thermistors each pass.
+  // stack modules so the slower GPIO/temperature poll can reuse it.
   for (uint8_t index = 0; index < configuredStackModules; ++index) {
     cacheGpioConfigAndEnableTsref(index, static_cast<uint8_t>(index + 1U));
   }
@@ -633,6 +1368,11 @@ bool batteryCommsBegin(const BmsSettings &settings, char *error,
   scanActive = false;
   setLastError("");
   return true;
+}
+
+void batteryCommsSetBackgroundService(void (*service)()) {
+  backgroundService = service;
+  lastBackgroundServiceAtMs = millis() - 1U;
 }
 
 bool batteryCommsIsReady() {
@@ -645,6 +1385,13 @@ const char *batteryCommsLastError() {
 
 void batteryCommsStartScan(BatterySnapshot &snapshot,
                            const BmsSettings &settings) {
+  const uint32_t now = millis();
+  scanTemperatureDue = !temperaturePollStarted ||
+      now - lastTemperaturePollAtMs >= settings.temperatureSamplePeriodMs;
+  if (scanTemperatureDue) {
+    temperaturePollStarted = true;
+    lastTemperaturePollAtMs = now;
+  }
   memset(&snapshot, 0, sizeof(snapshot));
   snapshot.moduleCount = settings.stackModules;
   snapshot.allCellReadsOk = true;
@@ -653,34 +1400,103 @@ void batteryCommsStartScan(BatterySnapshot &snapshot,
   scanModuleIndex = 0;
   scanActive = communicationReady && settings.stackModules > 0 &&
                settings.stackModules <= BATTERY_MAX_STACK_MODULES;
-}
-
-BatteryScanStepResult batteryCommsScanStep(BatterySnapshot &snapshot,
-                                           const BmsSettings &settings) {
-  // One call reads at most one module, leaving the main loop opportunities to
-  // service USB commands, CAN frames, and state-machine checks between modules.
-  if (!communicationReady || !scanActive) return BatteryScanStepResult::NotReady;
-
-  if (scanModuleIndex < snapshot.moduleCount) {
-    ModuleReading &module = snapshot.modules[scanModuleIndex];
-    readOneModule(scanModuleIndex, settings, module);
-    snapshot.validCellCount = static_cast<uint16_t>(
-        snapshot.validCellCount + module.validCellCount);
-    if (!module.cellReadOk) snapshot.allCellReadsOk = false;
-    if (!module.gpioReadOk) snapshot.allGpioReadsOk = false;
-    ++snapshot.completedModules;
-    ++scanModuleIndex;
+  scanTransactionPending = false;
+  asyncState = AsyncState::Idle;
+  if (scanActive && !scanTemperatureDue) {
+    for (uint8_t index = 0; index < snapshot.moduleCount; ++index) {
+      loadCachedGpioData(index, snapshot.modules[index]);
+    }
   }
-
-  if (scanModuleIndex >= snapshot.moduleCount) {
-    snapshot.finishedAtMs = millis();
-    snapshot.durationMs = snapshot.finishedAtMs - snapshot.startedAtMs;
-    scanActive = false;
-    return BatteryScanStepResult::Complete;
-  }
-  return BatteryScanStepResult::InProgress;
+  if (scanActive) initializeScanModule(snapshot);
 }
 
 void batteryCommsCancelScan() {
   scanActive = false;
+  scanTransactionPending = false;
+  asyncState = AsyncState::Idle;
+  uartLineQuietConfirmed = false;
+  asyncCanSkipTxQuiet = false;
+}
+
+void batteryCommsBalanceObserveScan(const BatterySnapshot &snapshot,
+                                    const BmsSettings &settings) {
+  balanceCandidateValid = false;
+  if (!snapshot.allCellReadsOk ||
+      snapshot.moduleCount != settings.stackModules ||
+      snapshot.validCellCount !=
+          static_cast<uint16_t>(settings.stackModules) *
+              settings.cellsPerModule) {
+    return;
+  }
+
+  uint16_t lowestMv = 0xFFFFU;
+  uint16_t highestMv = 0;
+  uint8_t highestAddress = 0;
+  uint8_t highestCell = 0;
+  for (uint8_t moduleIndex = 0; moduleIndex < snapshot.moduleCount;
+       ++moduleIndex) {
+    const ModuleReading &module = snapshot.modules[moduleIndex];
+    if (!module.cellReadOk || module.validCellCount != settings.cellsPerModule) {
+      balanceCandidateValid = false;
+      return;
+    }
+    for (uint8_t cellIndex = 0; cellIndex < settings.cellsPerModule;
+         ++cellIndex) {
+      if (module.cellRaw[cellIndex] == 0x8000U) return;
+      const float cellMv = module.cellMv[cellIndex];
+      if (!(cellMv > 0.0f && cellMv <= 5000.0f)) return;
+      const uint16_t measuredMv = static_cast<uint16_t>(cellMv + 0.5f);
+      if (measuredMv < lowestMv) lowestMv = measuredMv;
+      if (measuredMv > highestMv) {
+        highestMv = measuredMv;
+        highestAddress = module.address;
+        highestCell = static_cast<uint8_t>(cellIndex + 1U);
+      }
+    }
+  }
+
+  const uint16_t startDelta = static_cast<uint16_t>(
+      settings.balancingTargetDeltaMv + settings.balancingHysteresisMv);
+  if (lowestMv >= settings.balancingMinCellMv &&
+      highestMv >= lowestMv && highestMv - lowestMv >= startDelta) {
+    balanceCandidateAddress = highestAddress;
+    balanceCandidateCell = highestCell;
+    balanceCandidateMv = highestMv;
+    balanceCandidateValid = highestAddress != 0U && highestCell != 0U;
+  }
+}
+
+void batteryCommsBalanceService(const BmsSettings &settings, bool permitted) {
+  if (!BALANCING_HARDWARE_CONFIRMED) {
+    if (!settings.cellBalancingEnabled) {
+      setBalanceStatus("disabled in settings");
+    } else if (balanceCandidateValid) {
+      snprintf(balanceStatusText, sizeof(balanceStatusText),
+               "LOCKED: check resistor rating; candidate %u/%u at %u mV",
+               static_cast<unsigned>(balanceCandidateAddress),
+               static_cast<unsigned>(balanceCandidateCell),
+               static_cast<unsigned>(balanceCandidateMv));
+    } else {
+      setBalanceStatus("LOCKED: check resistor rating; no candidate");
+    }
+    return;
+  }
+  if (!communicationReady) {
+    setBalanceStatus("inhibited: BQ stack unavailable");
+    return;
+  }
+  if (scanActive) return;
+  serviceBalanceSequence(settings, permitted);
+}
+
+bool batteryCommsBalanceBusy() {
+  return balanceAsyncPending || balancePhase != BalancePhase::Idle;
+}
+
+bool batteryCommsBalanceIsActive() {
+  return balancePulseActive;
+}
+
+const char *batteryCommsBalanceStatus() {
+  return balanceStatusText;
 }

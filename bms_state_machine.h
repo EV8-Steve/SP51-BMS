@@ -16,13 +16,19 @@ enum class BmsOperatingState : uint8_t {
   Fault
 };
 
+enum class BmsFaultCode : uint8_t;
+
 struct BmsStateStatus {
   BmsOperatingState state;
   bool armed;
   bool runRequested;
+  bool chargeInputActive;
+  bool chargerMainsDetected;
   bool chargeRequested;
+  bool chargePrechargeActive;
   bool currentValid;
   bool cellDataFresh;
+  bool stackCommunicationFault;  // Active BQ recovery/failure annunciator.
   uint32_t prechargeElapsedMs;
   int32_t currentMilliamp;
   const char *reason;
@@ -37,10 +43,27 @@ void bmsStateMachineUpdate(const BmsSettings &settings,
                            const CurrentSensorStatus &current,
                            bool stackReady, bool cellDataFresh,
                            bool configurationMenuOpen);
+// Stack recovery is allowed to run while Drive outputs remain held. If all
+// retries fail, the Drive state waits for the RUN input to go inactive before
+// latching Fault and opening outputs.
+void bmsStateMachineSetStackRecovery(bool active, bool retriesExhausted);
+// A latched fault can be cleared manually after a complete fresh stack sample
+// and inactive-input checks. Communication-only EEPROM lockouts are also
+// cleared automatically after three consecutive complete scans with requests
+// inactive; other fault types remain manually latched.
+void bmsStateMachineSetStackHealth(bool ready, bool dataFresh,
+                                   bool readingsValid);
+void bmsStateMachineReportStackFault(const char *reason);
+// Restore an EEPROM-latched fault after the Nano reboots; no log duplicate is
+// written, and normal CLEARFAULT checks still apply.
+void bmsStateMachineRestorePersistentFault();
 // Command all outputs OFF and inhibit held requests until inputs release.
 void bmsStateMachineDisarm(const BmsSettings &settings);
 // Clear a latched fault only when both debounced input requests are inactive.
 bool bmsStateMachineClearFault();
+// Future Bender/SME input code can call this to latch the existing Fault state.
+// Returns false while isolation monitoring is disabled.
+bool bmsStateMachineReportIsolationFault();
 // Settings may change only when outputs are not in an active operating state.
 bool bmsStateMachineCanEditSettings();
 // Return current state, input, current and precharge status for the console.

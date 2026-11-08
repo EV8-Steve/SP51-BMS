@@ -20,10 +20,12 @@ struct SocStatus {
 
 // Load retained SOC at boot; if none exists, seed after the first valid cell scan.
 void socEstimatorBegin();
-// Integrate each fresh LEM frame once and periodically persist SOC/throughput.
+// Integrate each fresh LEM frame once and refresh the live SOC status.
 SocStatus socEstimatorUpdate(const BmsSettings &settings,
                              const BatteryLimitStatus &limits,
                              const CurrentSensorStatus &current);
+// Save pending SOC/throughput from a low-priority scheduler slot.
+void socEstimatorServicePersistence();
 // Manually set and immediately persist SOC as a calibration/commissioning action.
 bool socEstimatorSetPercent(float percent, const BmsSettings &settings);
 // Flush pending SOC and Ah totals before a software-requested reboot.

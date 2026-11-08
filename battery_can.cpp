@@ -1,13 +1,15 @@
 /*
-  Read-only LEM CAB500-C/SP7 CAN input.
+  Shared Nano R4 CAN bus for the LEM CAB500-C/SP7 sensor and Outlander OBC.
 
-  This module starts the Nano R4 CAN peripheral when the LEM sensor is selected,
-  filters the configured standard CAN ID, decodes current frames, and marks data
-  stale after its configured timeout. It never transmits CAN frames.
+  This module owns CAN begin/read/write so both devices share one controller.
+  It decodes the configured LEM frame, forwards Outlander status frames, and
+  queues standard transmissions only when the transmit mailbox is ready.
 */
 #include "battery_can.h"
 
 #include <Arduino_CAN.h>
+
+#include "outlander_charger.h"
 
 namespace {
 constexpr uint16_t CAN_RETRY_MS = 1000;
@@ -22,8 +24,22 @@ bool sensorNeedsCan(const BmsSettings &settings) {
   return settings.currentSensor == CurrentSensorType::LemCab500Can;
 }
 
+bool chargerNeedsCan(const BmsSettings &settings) {
+  return settings.chargerType == ChargerType::Outlander;
+}
+
+bool canBusNeeded(const BmsSettings &settings) {
+  return sensorNeedsCan(settings) || chargerNeedsCan(settings);
+}
+
+uint32_t requestedCanBitrate(const BmsSettings &settings) {
+  // The LEM and Outlander OBC are attached to one physical CAN segment.
+  return chargerNeedsCan(settings) ? settings.chargerCanBitrate
+                                   : settings.currentCanBitrate;
+}
+
 void beginCanIfNeeded(const BmsSettings &settings) {
-  if (!sensorNeedsCan(settings)) {
+  if (!canBusNeeded(settings)) {
     if (canStarted) {
       CAN.end();
       canStarted = false;
@@ -33,8 +49,20 @@ void beginCanIfNeeded(const BmsSettings &settings) {
     return;
   }
 
-  if (canStarted && activeBitrate == settings.currentCanBitrate) {
-    sensorStatus.canReady = true;
+  const uint32_t bitrate = requestedCanBitrate(settings);
+  if (chargerNeedsCan(settings) &&
+      settings.currentCanBitrate != settings.chargerCanBitrate) {
+    if (canStarted) {
+      CAN.end();
+      canStarted = false;
+      activeBitrate = 0;
+    }
+    sensorStatus.canReady = false;
+    return;
+  }
+
+  if (canStarted && activeBitrate == bitrate) {
+    sensorStatus.canReady = sensorNeedsCan(settings);
     return;
   }
 
@@ -46,9 +74,9 @@ void beginCanIfNeeded(const BmsSettings &settings) {
     CAN.end();
     canStarted = false;
   }
-  canStarted = CAN.begin(settings.currentCanBitrate);
-  activeBitrate = canStarted ? settings.currentCanBitrate : 0;
-  sensorStatus.canReady = canStarted;
+  canStarted = CAN.begin(bitrate);
+  activeBitrate = canStarted ? bitrate : 0;
+  sensorStatus.canReady = canStarted && sensorNeedsCan(settings);
 }
 
 void acceptCurrentFrame(const CanMsg &message) {
@@ -95,15 +123,21 @@ void batteryCanBegin(const BmsSettings &settings) {
 
 void batteryCanPoll(const BmsSettings &settings) {
   beginCanIfNeeded(settings);
-  if (!canStarted || !sensorNeedsCan(settings)) return;
+  // Outlander telemetry must still be drained when the CAN controller is
+  // enabled for the charger but the optional LEM sensor is turned off.
+  if (!canStarted) return;
 
   while (CAN.available()) {
     const CanMsg message = CAN.read();
-    if (!message.isStandardId() ||
-        message.getStandardId() != settings.currentCanId) {
-      continue;
+    if (!message.isStandardId()) continue;
+
+    const uint16_t id = static_cast<uint16_t>(message.getStandardId());
+    if (sensorNeedsCan(settings) && id == settings.currentCanId) {
+      acceptCurrentFrame(message);
     }
-    acceptCurrentFrame(message);
+    if (chargerNeedsCan(settings) && (id == 0x389U || id == 0x38AU)) {
+      outlanderChargerAcceptCanFrame(id, message.data_length, message.data);
+    }
   }
 }
 
@@ -122,4 +156,16 @@ CurrentSensorStatus batteryCanCurrent(const BmsSettings &settings) {
     result.currentMilliamp = -result.currentMilliamp;
   }
   return result;
+}
+
+bool batteryCanBusReady() {
+  return canStarted;
+}
+
+bool batteryCanSendStandardFrame(uint16_t id, const uint8_t *data,
+                                 uint8_t length) {
+  if (!canStarted || id > 0x7FFU || length > CanMsg::MAX_DATA_LENGTH ||
+      (length > 0U && !data) || !CAN.txReady()) return false;
+  const CanMsg message(arduino::CanStandardId(id), length, data);
+  return CAN.write(message) > 0;
 }

@@ -19,6 +19,7 @@ bool initialized = false;
 bool seededFromVoltage = false;
 bool stateStored = false;
 bool dirty = false;
+bool saveRequested = false;
 float socPercent = 0.0f;
 float chargedAh = 0.0f;
 float dischargedAh = 0.0f;
@@ -70,6 +71,7 @@ bool saveNow() {
   if (saved) {
     stateStored = true;
     dirty = false;
+    saveRequested = false;
     lastSavedAtMs = lastSaveAttemptAtMs;
   }
   return saved;
@@ -82,8 +84,8 @@ void initializeFromVoltage(const BmsSettings &settings,
   initialized = true;
   seededFromVoltage = true;
   dirty = true;
-  // Save the first estimate promptly so an early reset does not lose it.
-  saveNow();
+  // Ask the scheduler to save this first seed outside the CAN/BQ hot path.
+  saveRequested = true;
 }
 
 void integrateCurrent(const BmsSettings &settings,
@@ -136,8 +138,9 @@ void integrateCurrent(const BmsSettings &settings,
 
 void persistIfDue() {
   const uint32_t now = millis();
-  if (!initialized || !dirty || now - lastSavedAtMs < SOC_SAVE_PERIOD_MS ||
+  if (!initialized || !dirty ||
       now - lastSaveAttemptAtMs < SOC_SAVE_PERIOD_MS) return;
+  if (!saveRequested && now - lastSavedAtMs < SOC_SAVE_PERIOD_MS) return;
   saveNow();
 }
 }
@@ -147,6 +150,7 @@ void socEstimatorBegin() {
   seededFromVoltage = false;
   stateStored = false;
   dirty = false;
+  saveRequested = false;
   socPercent = 0.0f;
   chargedAh = 0.0f;
   dischargedAh = 0.0f;
@@ -187,8 +191,11 @@ SocStatus socEstimatorUpdate(const BmsSettings &settings,
     if (initialized) integrateCurrent(settings, current, true);
   }
 
-  persistIfDue();
   return socEstimatorStatus(settings);
+}
+
+void socEstimatorServicePersistence() {
+  persistIfDue();
 }
 
 bool socEstimatorSetPercent(float percent, const BmsSettings &settings) {
@@ -199,15 +206,18 @@ bool socEstimatorSetPercent(float percent, const BmsSettings &settings) {
   const bool previousVoltageSeeded = seededFromVoltage;
   const bool previousStateStored = stateStored;
   const bool previousDirty = dirty;
+  const bool previousSaveRequested = saveRequested;
   const bool previousCurrentBaselineValid = previousCurrentValid;
   const int32_t previousBaselineMilliamp = previousCurrentMilliamp;
   const uint32_t previousBaselineAtMs = previousCurrentAtMs;
   const uint32_t previousSavedAtMs = lastSavedAtMs;
+  const uint32_t previousSaveAttemptAtMs = lastSaveAttemptAtMs;
   socPercent = percent;
   initialized = true;
   seededFromVoltage = false;
   previousCurrentValid = false;
   dirty = true;
+  saveRequested = true;
   if (saveNow()) return true;
 
   // A calibration command reports success only when its CRC record verifies.
@@ -217,10 +227,12 @@ bool socEstimatorSetPercent(float percent, const BmsSettings &settings) {
   seededFromVoltage = previousVoltageSeeded;
   stateStored = previousStateStored;
   dirty = previousDirty;
+  saveRequested = previousSaveRequested;
   previousCurrentValid = previousCurrentBaselineValid;
   previousCurrentMilliamp = previousBaselineMilliamp;
   previousCurrentAtMs = previousBaselineAtMs;
   lastSavedAtMs = previousSavedAtMs;
+  lastSaveAttemptAtMs = previousSaveAttemptAtMs;
   return false;
 }
 

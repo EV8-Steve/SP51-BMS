@@ -9,9 +9,11 @@
 
 #include "serial_console.h"
 
+#include "batterycomms.h"
 #include "charger_relay.h"
 #include "bms_outputs.h"
 #include "bms_state_machine.h"
+#include "fault_log.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,13 +23,21 @@
 namespace {
 constexpr size_t COMMAND_BUFFER_SIZE = 64;
 constexpr size_t DISPLAY_BUFFER_SIZE = 6144;
+constexpr size_t STACK_STATUS_SIZE = 48;
 // Stable padded width reduces column movement in ordinary serial terminals.
-constexpr size_t DISPLAY_FRAME_WIDTH = 160;
+constexpr size_t DISPLAY_FRAME_WIDTH = 180;
 char commandBuffer[COMMAND_BUFFER_SIZE] = {};
+char deferredCommandBuffer[COMMAND_BUFFER_SIZE] = {};
 char displayBuffer[DISPLAY_BUFFER_SIZE] = {};
 size_t commandLength = 0;
+size_t displaySendLength = 0;
+size_t displaySendOffset = 0;
 bool menuOpen = false;
 bool retryRequested = false;
+bool displaySendPending = false;
+bool deferredCommandPending = false;
+bool stackStatusNotificationPending = false;
+char stackStatusText[STACK_STATUS_SIZE] = "STARTUP";
 
 enum class MenuPage : uint8_t {
   Main = 0,
@@ -37,7 +47,10 @@ enum class MenuPage : uint8_t {
   SocEstimation,
   Outputs,
   Monitor,
-  StateControl
+  StateControl,
+  IsolationMonitor,
+  FaultLog,
+  Balancing
 };
 
 MenuPage menuPage = MenuPage::Main;
@@ -111,6 +124,10 @@ void appendFixed(char *buffer, size_t capacity, size_t &length, bool &ok,
     snprintf(number, sizeof(number), "%s%lu.%01lu", negative ? "-" : "",
              static_cast<unsigned long>(whole),
              static_cast<unsigned long>(fraction));
+  } else if (decimals == 2) {
+    snprintf(number, sizeof(number), "%s%lu.%02lu", negative ? "-" : "",
+             static_cast<unsigned long>(whole),
+             static_cast<unsigned long>(fraction));
   } else if (decimals == 3) {
     snprintf(number, sizeof(number), "%s%lu.%03lu", negative ? "-" : "",
              static_cast<unsigned long>(whole),
@@ -142,7 +159,22 @@ void appendCellValue(char *buffer, size_t capacity, size_t &length, bool &ok,
 }
 
 const char *currentSensorName(CurrentSensorType type) {
-  return type == CurrentSensorType::LemCab500Can ? "LEM CAB500-C/SP7 CAN" : "OFF";
+  switch (type) {
+    case CurrentSensorType::Off: return "OFF";
+    case CurrentSensorType::LemCab500Can: return "LEM CAB500-C/SP7 CAN";
+    case CurrentSensorType::SmePlaceholder: return "SME (placeholder; decoder not implemented)";
+    default: return "UNKNOWN";
+  }
+}
+
+const char *contactorControlName(ContactorControlType type) {
+  return type == ContactorControlType::SmePlaceholder
+      ? "SME (placeholder; control not implemented)" : "Nano low-side FET";
+}
+
+const char *isolationMonitorName(IsolationMonitorType type) {
+  return type == IsolationMonitorType::SmePlaceholder ? "SME (not implemented)"
+                                                       : "Bender (not implemented)";
 }
 
 const char *chargerName(ChargerType type) {
@@ -185,6 +217,18 @@ void printSettings(const BmsSettings &settings) {
   Serial.print(F("  Monitor period target: "));
   Serial.print(settings.samplePeriodMs);
   Serial.println(F(" ms start-to-start; minimum 500 ms, maximum 5000 ms."));
+  Serial.print(F("  Temperature/GPIO period: "));
+  Serial.print(settings.temperatureSamplePeriodMs);
+  Serial.println(F(" ms; cell voltages continue at the monitor period."));
+  Serial.print(F("  Cell balancing: "));
+  Serial.print(settings.cellBalancingEnabled ? F("requested ON") : F("OFF"));
+  Serial.print(F("; status=")); Serial.println(batteryCommsBalanceStatus());
+  Serial.print(F("    delta target=")); Serial.print(settings.balancingTargetDeltaMv);
+  Serial.print(F(" mV; hysteresis=")); Serial.print(settings.balancingHysteresisMv);
+  Serial.print(F(" mV; min cell=")); Serial.print(settings.balancingMinCellMv);
+  Serial.print(F(" mV; max pulse=")); Serial.print(settings.balancingMaxOnSeconds);
+  Serial.print(F(" s; cool-off=")); Serial.print(settings.balancingCoolOffMs / 1000UL);
+  Serial.print(F(" s; conservatism=")); Serial.println(settings.balancingConservativeLevel);
   Serial.print(F("  Provisional NTC: pull-up "));
   Serial.print(settings.ntcPullupOhms, 0);
   Serial.print(F(" ohm, R25 "));
@@ -223,12 +267,18 @@ void printSettings(const BmsSettings &settings) {
   Serial.print(F(" kbit/s; ID 0x")); Serial.print(settings.currentCanId, HEX);
   Serial.print(F("; invert=")); Serial.println(settings.invertCurrent ? F("YES") : F("NO"));
   Serial.print(F("  Charger profile: ")); Serial.print(chargerName(settings.chargerType));
+  Serial.print(F("; connection="));
+  Serial.print(settings.chargerBehindContactors ? F("BEHIND CONTACTORS") : F("DIRECT TO PACK"));
   Serial.print(F("; Outlander CAN TX="));
   Serial.println(settings.chargerTxEnabled ? F("ENABLED") : F("DISABLED"));
   Serial.println(F("  Output pin map (active HIGH into low-side FETs):"));
   printOutputPin("    Main positive: ", settings.mainPositivePin);
   printOutputPin("    Main negative: ", settings.mainNegativePin);
+  Serial.print(F("      Main-negative controller: "));
+  Serial.println(contactorControlName(settings.mainNegativeControl));
   printOutputPin("    Precharge:     ", settings.prechargePin);
+  Serial.print(F("      Precharge controller: "));
+  Serial.println(contactorControlName(settings.prechargeControl));
   printOutputPin("    Charger relay: ", settings.chargerRelayPin);
   printOutputPin("    Run input:     ", settings.runInputPin);
   printOutputPin("    240 V input:   ", settings.chargeInputPin);
@@ -236,12 +286,71 @@ void printSettings(const BmsSettings &settings) {
   Serial.println(settings.runInputActiveHigh ? F("HIGH") : F("LOW"));
   Serial.print(F("    240 V active level: "));
   Serial.println(settings.chargeInputActiveHigh ? F("HIGH") : F("LOW"));
+  Serial.print(F("  Isolation monitor: "));
+  Serial.print(settings.isolationMonitorEnabled ? F("ENABLED") : F("DISABLED"));
+  Serial.print(F("; source=")); Serial.print(isolationMonitorName(settings.isolationMonitorType));
+  Serial.print(F("; fault input="));
+  if (settings.isolationMonitorPin == 0xFFU) Serial.println(F("unassigned"));
+  else { Serial.print('D'); Serial.println(settings.isolationMonitorPin); }
+  Serial.print(F("    Configured active fault level: "));
+  Serial.println(settings.isolationFaultActiveHigh ? F("HIGH") : F("LOW"));
+  Serial.println(F("    Bender/SME sensing is not implemented; enabling inhibits BMS arming."));
   const BmsStateStatus state = bmsStateMachineStatus();
   Serial.print(F("  Controller state: "));
   Serial.print(bmsOperatingStateName(state.state));
+    Serial.print(F("; stack comm fault="));
+    Serial.print(state.stackCommunicationFault ? F("YES") : F("NO"));
   Serial.print(F("; armed="));
   Serial.println(state.armed ? F("YES") : F("NO"));
-  Serial.println(F("    Output gates are active HIGH; controller may operate from the two isolated inputs."));
+  Serial.println(F("    Run, isolated 240 V input or fresh Outlander CAN mains may request operation."));
+}
+
+void printFaultLog() {
+  Serial.println(F("FAULT / EVENT LOG - EEPROM history, newest first"));
+  Serial.println(F("CURRENT means the entry belongs to the active drive cycle."));
+  Serial.println(F("Communication-only lockouts clear after 3 complete scans with Run/charge requests inactive; history entries remain."));
+  Serial.println(F("Drive-cycle tags describe when an event occurred; they are separate from the persistent lockout above."));
+  if (!faultLogAvailable()) {
+    Serial.println(F("Fault log unavailable: its EEPROM range could not be reserved safely."));
+    return;
+  }
+  Serial.print(F("Persistent BMS fault lockout: "));
+  Serial.println(faultLogHasPersistentFault()
+                     ? faultLogCodeName(faultLogPersistentFaultCode())
+                     : "none");
+  const uint8_t count = faultLogCount();
+  if (count == 0U) {
+    Serial.println(F("No faults or stack communication events recorded."));
+    return;
+  }
+
+  Serial.print(F("Records: ")); Serial.print(count);
+  Serial.print(F("  Current drive cycle: "));
+  const uint32_t latestDriveCycle = faultLogCurrentDriveCycle();
+  Serial.println(latestDriveCycle);
+  for (uint8_t i = 0; i < count; ++i) {
+    FaultLogEntry entry = {};
+    if (!faultLogReadNewest(i, entry)) continue;
+    const bool previousCycle = entry.driveCycle != 0U &&
+        (entry.driveCycle == latestDriveCycle ||
+         (latestDriveCycle > 1U && entry.driveCycle == latestDriveCycle - 1U));
+    const char *cycleText = entry.belongsToCurrentDriveCycle
+        ? "CURRENT DRIVE CYCLE"
+        : (previousCycle ? "PREVIOUS DRIVE CYCLE"
+                         : (entry.driveCycle ? "OLDER DRIVE CYCLE"
+                                             : "NO DRIVE CYCLE YET"));
+    Serial.print(F("#")); Serial.print(entry.sequence);
+    Serial.print(F("  ")); Serial.print(cycleText);
+    Serial.print(F("  CYCLE=")); Serial.print(entry.driveCycle);
+    Serial.print(F("  TYPE=")); Serial.print(faultLogCodeName(entry.code));
+    Serial.print(F("  STATE="));
+    Serial.print(bmsOperatingStateName(entry.state));
+    Serial.print(F("  DRIVE_ACTIVE="));
+    Serial.print(entry.occurredDuringDriveCycle ? F("YES") : F("NO"));
+    Serial.print(F("  BOOT=")); Serial.print(entry.bootCount);
+    Serial.print(F("  UP=")); Serial.print(entry.uptimeSeconds);
+    Serial.println(F("s"));
+  }
 }
 
 void printMenu() {
@@ -256,16 +365,19 @@ void printMenu() {
     Serial.println();
     Serial.println(F("MAIN MENU - type a number or the section name:"));
     Serial.println(F("  1 battery  - cell voltage limits and discharge cut-off settings"));
-    Serial.println(F("  2 charging - charge target, hysteresis, current, capacity and charger profile"));
-    Serial.println(F("  3 current  - LEM current sensor CAN input and polarity settings"));
+    Serial.println(F("  2 charging - target, current, charger profile/path and Outlander CAN"));
+    Serial.println(F("  3 current  - LEM/SME current sensor selection and polarity settings"));
     Serial.println(F("  4 SOC      - coulomb counting, voltage seed curve and SOC calibration"));
     Serial.println(F("  5 outputs  - map main contactor, precharge and charger relay FET pins"));
-    Serial.println(F("  6 monitor  - scan interval and BQ stack retry"));
+    Serial.println(F("  6 monitor  - cell/temperature scan intervals and BQ stack retry"));
     Serial.println(F("  7 state    - precharge settings, input polarity, status and fault clear"));
+    Serial.println(F("  8 isolation - Bender/SME monitor placeholder, input and polarity"));
+    Serial.println(F("  9 faults   - persistent fault/event history and drive-cycle tags"));
+    Serial.println(F(" 10 balancing - cell target, timed pulse and cool-off settings"));
     Serial.println(F("  s/settings - show all current settings, input/output pins and state"));
     Serial.println(F("  reboot     - restart the Nano and rerun BQ startup; does not hardware-reset BQ devices"));
-    Serial.println(F("  disarm     - immediately open all mapped outputs; automatic restart waits for input release"));
-    Serial.println(F("  help       - explain this menu; x exits, reinitializes stack, resumes live data"));
+    Serial.println(F("  disarm     - request output OFF; ignored in Drive, where RUN input controls shutdown"));
+    Serial.println(F("  help       - explain this menu; x exits (stack restart only while not active)"));
   } else if (menuPage == MenuPage::BatteryLimits) {
     const BmsSettings &settings = settingsGet();
     Serial.println(F("BATTERY LIMITS"));
@@ -301,6 +413,10 @@ void printMenu() {
     Serial.println(F(" V (cell target x series count)"));
     Serial.print(F("  Selected charger profile: "));
     Serial.println(chargerName(settings.chargerType));
+    Serial.print(F("  Charger connection: "));
+    Serial.println(settings.chargerBehindContactors
+                       ? F("BEHIND CONTACTORS (precharge, then close mains)")
+                       : F("DIRECT TO PACK (keep mains open during charge)"));
     Serial.print(F("  Charger CAN transmit: "));
     Serial.println(settings.chargerTxEnabled ? F("ENABLED") : F("DISABLED"));
     Serial.println();
@@ -312,10 +428,14 @@ void printMenu() {
     Serial.println(F("  set cap <Ah>     set total pack capacity used by SOC (0.1..2000 Ah)"));
     Serial.println(F("  set series <N>   set pack series-cell count (1..160; current pack is 108S)"));
     Serial.println(F("  set charger <type>  none|relay|outlander|brusa|volt|eltek|elcon|victron"));
-    Serial.println(F("  Outlander CAN transmission is disabled; this menu selects a profile only."));
+    Serial.println(F("  set chargerpath direct|behind  choose pack-direct or behind-contactors wiring"));
+    Serial.println(F("  set chargercan on|off  enable Disarmed/Ready wake and Charge CAN commands"));
+    Serial.println(F("  Behind mode precharges and closes both main contactors before enabling charge."));
+    Serial.println(F("  External Relay needs its mapped FET; Outlander uses CAN and does not use that relay."));
+    Serial.println(F("  Outlander OBC and LEM share the 500 kbit/s bus; wake runs Disarmed/Ready and setpoints run in Charge."));
   } else if (menuPage == MenuPage::CurrentSensor) {
     const BmsSettings &settings = settingsGet();
-    Serial.println(F("CURRENT SENSOR - LEM CAB500-C/SP7 reports current over CAN."));
+    Serial.println(F("CURRENT SENSOR - select the active current input hardware."));
     Serial.println(F("Current settings:"));
     Serial.print(F("  Sensor type: ")); Serial.println(currentSensorName(settings.currentSensor));
     Serial.print(F("  CAN bitrate: ")); Serial.print(settings.currentCanBitrate / 1000UL);
@@ -326,11 +446,13 @@ void printMenu() {
     Serial.println(F(" ms"));
     Serial.println();
     Serial.println(F("Commands:"));
-    Serial.println(F("  set sensor lem|off  select LEM CAN sensor or disable current input"));
+    Serial.println(F("  set sensor lem|off|sme  select LEM CAN, disable input, or choose SME placeholder"));
+    Serial.println(F("  SME is a saved placeholder only; decoding is unimplemented and BMS control stays disarmed."));
     Serial.println(F("  set canrate 250|500  set CAN bitrate in kbit/s (250 or 500)"));
     Serial.println(F("  set canid <ID>  set standard CAN ID 1..0x7FF (decimal or hex, e.g. 0x3C2)"));
     Serial.println(F("  set invert 0|1  leave current sign unchanged (0) or reverse it (1)"));
-    Serial.println(F("  Fresh LEM current is a precharge/interlock input; current regulation and charger CAN TX are not active."));
+    Serial.println(F("  Outlander shares this 500 kbit/s bus; the rate is fixed to 500 while that profile is selected."));
+    Serial.println(F("  Fresh LEM current is a precharge/interlock input; charger current control uses the OBC CAN setpoint."));
   } else if (menuPage == MenuPage::SocEstimation) {
     const BmsSettings &settings = settingsGet();
     const SocStatus soc = socEstimatorStatus(settings);
@@ -382,37 +504,81 @@ void printMenu() {
     Serial.println(F("Current output mapping (active HIGH into low-side FET gates):"));
     printOutputPin("  Main positive contactor: ", settings.mainPositivePin);
     printOutputPin("  Main negative contactor: ", settings.mainNegativePin);
+    Serial.print(F("    Main-negative control: "));
+    Serial.println(contactorControlName(settings.mainNegativeControl));
     printOutputPin("  Precharge contactor:     ", settings.prechargePin);
+    Serial.print(F("    Precharge control:     "));
+    Serial.println(contactorControlName(settings.prechargeControl));
     printOutputPin("  External charger relay:  ", settings.chargerRelayPin);
     printOutputPin("  Isolated Run input:      ", settings.runInputPin);
     printOutputPin("  Isolated 240 V input:    ", settings.chargeInputPin);
+    printOutputPin("  Isolation fault input:  ", settings.isolationMonitorPin);
     Serial.println();
     Serial.println(F("Commands (pins are Arduino digital pin numbers):"));
     Serial.println(F("  set pin mainpos <pin|none>  map/unmap positive main contactor output"));
     Serial.println(F("  set pin mainneg <pin|none>  map/unmap negative main contactor output"));
     Serial.println(F("  set pin precharge <pin|none>  map/unmap precharge contactor output"));
+    Serial.println(F("  set contactor mainneg fet|sme  choose Nano FET or SME placeholder control"));
+    Serial.println(F("  set contactor precharge fet|sme choose Nano FET or SME placeholder control"));
+    Serial.println(F("  SME contactor options are not implemented; they block Drive and behind-contactor Charge."));
+    Serial.println(F("  SME mode retains any mapped Nano pin but holds its FET gate LOW."));
     Serial.println(F("  set pin charger <pin|none>  map/unmap external charger relay output"));
     Serial.println(F("  set pin run <pin>     map isolated 12 V Run input (default D2)"));
     Serial.println(F("  set pin charge <pin>  map isolated 240 V-present input (default D3)"));
-    Serial.println(F("  Output pins: 6, 13, 11, 10, or none. Input pins: D2..D13."));
-    Serial.println(F("  All assigned input/output pins must be unique; D0/D1 are reserved for BQ UART."));
+    Serial.println(F("  set pin isolation <pin|none>  map/unmap Bender fault input (not read yet)"));
+    Serial.println(F("  Output pins: 6, 13, 11, 10, or none. Input pins: D2, D3, D6..D13."));
+    Serial.println(F("  D0/D1 are reserved for BQ UART; D4/D5 are reserved for Nextion SoftwareSerial."));
+    Serial.println(F("  All assigned input/output pins must be unique."));
     Serial.println(F("  Both isolated inputs default to active LOW; change polarity in State Control if needed."));
     Serial.println(F("  Outputs are active HIGH into low-side FET gates; DISARM commands all mapped outputs OFF."));
     Serial.println(F("  Example: set pin mainpos 6   |   set pin charger 10"));
+  } else if (menuPage == MenuPage::IsolationMonitor) {
+    const BmsSettings &settings = settingsGet();
+    Serial.println(F("ISOLATION MONITORING - CONFIGURATION PLACEHOLDER"));
+    Serial.println(F("Current settings:"));
+    Serial.print(F("  Monitoring: "));
+    Serial.println(settings.isolationMonitorEnabled ? F("ENABLED (BMS remains disarmed)") : F("DISABLED"));
+    Serial.print(F("  Selected source: "));
+    Serial.println(isolationMonitorName(settings.isolationMonitorType));
+    printOutputPin("  Bender fault input pin: ", settings.isolationMonitorPin);
+    Serial.print(F("  Configured active fault level: "));
+    Serial.println(settings.isolationFaultActiveHigh ? F("HIGH") : F("LOW"));
+    Serial.println();
+    Serial.println(F("Commands (changes save immediately):"));
+    Serial.println(F("  set isolation on|off          enable placeholder or disable it"));
+    Serial.println(F("  set isolationtype bender|sme  choose the intended monitor source"));
+    Serial.println(F("  set pin isolation <pin|none>  assign standalone Bender fault input"));
+    Serial.println(F("  set isolationpol high|low     configure future fault-signal polarity"));
+    Serial.println();
+    Serial.println(F("Bender and SME sensing are NOT IMPLEMENTED; no signal is sampled or validated."));
+    Serial.println(F("The pin and polarity are stored only. Enabling the option holds control disarmed."));
+    Serial.println(F("A future monitor driver can call bmsStateMachineReportIsolationFault() to latch Fault."));
+    Serial.println(F("Cell OV blocks Charge and latches Fault only during Charge/charge precharge; Drive remains available to discharge."));
+    Serial.println(F("Drive UV/discharge trips Fault. Charge recovery from under-voltage remains allowed."));
   } else if (menuPage == MenuPage::StateControl) {
     const BmsSettings &settings = settingsGet();
     const BmsStateStatus state = bmsStateMachineStatus();
     Serial.println(F("STATE CONTROL AND SIMPBMS-STYLE PRECHARGE"));
     Serial.print(F("  State: ")); Serial.println(bmsOperatingStateName(state.state));
+    Serial.print(F("  Stack communication fault flag: "));
+    Serial.println(state.stackCommunicationFault ? F("ACTIVE") : F("clear"));
     Serial.print(F("  Automatic control: ")); Serial.println(state.armed ? F("ARMED") : F("DISARMED"));
     Serial.print(F("  Run request D")); Serial.print(settings.runInputPin);
     Serial.print(F(" (12 V isolated, active "));
     Serial.print(settings.runInputActiveHigh ? F("HIGH") : F("LOW"));
     Serial.print(F("), stable=")); Serial.println(state.runRequested ? F("YES") : F("NO"));
-    Serial.print(F("  240 V request D")); Serial.print(settings.chargeInputPin);
+    Serial.print(F("  240 V input D")); Serial.print(settings.chargeInputPin);
     Serial.print(F(" (isolated, active "));
     Serial.print(settings.chargeInputActiveHigh ? F("HIGH") : F("LOW"));
-    Serial.print(F("), stable=")); Serial.println(state.chargeRequested ? F("YES") : F("NO"));
+    Serial.print(F("), stable=")); Serial.println(state.chargeInputActive ? F("YES") : F("NO"));
+    Serial.print(F("  Outlander CAN mains detected: "));
+    Serial.println(state.chargerMainsDetected ? F("YES") : F("NO"));
+    Serial.print(F("  Effective charge request: "));
+    Serial.println(state.chargeRequested ? F("YES") : F("NO"));
+    Serial.print(F("  Charger wiring mode: "));
+    Serial.println(settings.chargerBehindContactors
+                       ? F("BEHIND CONTACTORS; charge uses precharge first")
+                       : F("DIRECT TO PACK; main contactors stay open"));
     Serial.print(F("  Precharge elapsed: ")); Serial.print(state.prechargeElapsedMs);
     Serial.println(F(" ms"));
     Serial.print(F("  Current: "));
@@ -430,27 +596,79 @@ void printMenu() {
     Serial.println(F("  set precurrent <A>    finish when |LEM current| is at/below this value (0.1..50 A)"));
     Serial.println(F("  set runpol high|low   active level for the isolated Run input"));
     Serial.println(F("  set chargepol high|low active level for isolated 240 V-present input"));
-    Serial.println(F("  clearfault            clear a latched fault only when both requests are inactive"));
-    Serial.println(F("  Physical Run/240 V inputs request operation; no terminal ARM command is needed."));
-    Serial.println(F("  Charge relay starts only with the External Relay charger profile; Outlander CAN TX is disabled."));
+    Serial.println(F("  Cell over-voltage blocks Charge; while Charge/precharge is active it latches Fault."));
+    Serial.println(F("  Over-voltage does not block Drive, allowing discharge recovery."));
+    Serial.println(F("  Drive under-voltage/discharge violation latches Fault; Charge recovery remains allowed."));
+    Serial.println(F("  clearfault            clear a latched fault only with inactive requests and a fresh full-stack scan"));
+    Serial.println(F("  Run input requests Drive; 240 V input or fresh Outlander CAN mains requests Charge."));
+    Serial.println(F("  No terminal ARM command is needed."));
+    Serial.println(F("  External Relay charging uses the mapped FET; Outlander charging uses 0x286 after its CAN-ready check."));
   } else if (menuPage == MenuPage::Monitor) {
     const BmsSettings &settings = settingsGet();
     Serial.println(F("MONITOR - settings are saved to EEPROM and restored at startup."));
-    Serial.print(F("Current scan target: ")); Serial.print(settings.samplePeriodMs);
+    Serial.print(F("Cell scan target: ")); Serial.print(settings.samplePeriodMs);
     Serial.println(F(" ms"));
+    Serial.print(F("Temperature/GPIO poll period: "));
+    Serial.print(settings.temperatureSamplePeriodMs);
+    Serial.println(F(" ms (retained ADC values are reused between polls)."));
     Serial.print(F("Stack configuration: ")); Serial.print(settings.stackModules);
     Serial.print(F(" stack devices x ")); Serial.print(settings.cellsPerModule);
     Serial.println(F(" cells/device"));
     Serial.println();
     Serial.println(F("Commands:"));
-    Serial.println(F("  set p <ms>  set requested battery scan interval (500..5000 ms)"));
+    Serial.println(F("  set p <ms>     set cell-voltage scan interval (500..5000 ms)"));
+    Serial.println(F("  set temp <ms>  set temperature/GPIO poll interval (500..10000 ms)"));
     Serial.println(F("  r       restart the BQ startup/communication initialization sequence"));
-    Serial.println(F("  The stack scan is never overlapped; long scans can exceed the target interval."));
+    Serial.println(F("  The full cell scan is never overlapped; long scans can exceed its target interval."));
+  } else if (menuPage == MenuPage::Balancing) {
+    const BmsSettings &settings = settingsGet();
+    Serial.println(F("CELL BALANCING - BQ79616 passive CBFET control"));
+    Serial.print(F("  Enable request: "));
+    Serial.println(settings.cellBalancingEnabled ? F("ON") : F("OFF"));
+    Serial.print(F("  Driver status: "));
+    Serial.println(batteryCommsBalanceStatus());
+    Serial.print(F("  Target delta: ")); Serial.print(settings.balancingTargetDeltaMv);
+    Serial.println(F(" mV across pack; starts above target delta + hysteresis."));
+    Serial.print(F("  Hysteresis: ")); Serial.print(settings.balancingHysteresisMv);
+    Serial.println(F(" mV"));
+    Serial.print(F("  Minimum cell voltage: ")); Serial.print(settings.balancingMinCellMv);
+    Serial.println(F(" mV; below this, balancing is inhibited."));
+    Serial.print(F("  Configured maximum BQ timer: ")); Serial.print(settings.balancingMaxOnSeconds);
+    Serial.println(F(" s"));
+    Serial.print(F("  Conservative level: ")); Serial.print(settings.balancingConservativeLevel);
+    Serial.println(settings.balancingConservativeLevel == 0U
+                       ? F(" (standard)")
+                       : (settings.balancingConservativeLevel == 1U
+                              ? F(" (moderate: max 30 s, 2x cool-off)")
+                              : F(" (high: max 10 s, 4x cool-off)")));
+    Serial.print(F("  Cool-off after pulse: "));
+    Serial.print(settings.balancingCoolOffMs / 1000UL);
+    Serial.println(F(" s"));
+    Serial.println();
+    Serial.println(F("Commands (SET required; accepted changes save immediately):"));
+    Serial.println(F("  set balance on|off       request balancing enable/disable"));
+    Serial.println(F("  set bdelta <mV>          set target pack max-min cell delta (5..300 mV)"));
+    Serial.println(F("  set bhyst <mV>           add required start/restart delta (1..100 mV)"));
+    Serial.println(F("  set bmin <mV>            inhibit balancing below this lowest-cell voltage (3000..4200 mV)"));
+    Serial.println(F("  set bon <seconds>        set BQ timer: 10, 30 or 60 seconds"));
+    Serial.println(F("  set blevel 0|1|2         standard, moderate or high conservative duty limit"));
+    Serial.println(F("  set bcool <seconds>      set rest between pulses (60..3600 seconds)"));
+    Serial.println();
+    Serial.println(F("Safety gate: actual BQ balancing writes are locked until resistor wattage and the fitted bleed path are verified."));
+    Serial.println(F("Estimated path from resistor count: 2 x 50 ohm gives about 42 mA and 0.176 W total at 4.2 V."));
+    Serial.println(F("Only one highest cell would be pulsed globally; operation is restricted to Disarmed/Ready, zero requests, fresh scans, minimum cell voltage and near-zero valid current."));
+    Serial.println(F("No resistor temperature sensor is validated; the cool-off timer is an additional safeguard, not thermal proof."));
+  } else if (menuPage == MenuPage::FaultLog) {
+    printFaultLog();
   }
   Serial.println();
   Serial.println(F("Command: back returns from this submenu to the main configuration menu."));
-  Serial.println(F("Navigation: s/settings shows all settings; x exits, reinitializes stack, then resumes scans."));
-  Serial.println(F("Type help to repeat this submenu; values are saved immediately when accepted."));
+  Serial.println(F("Navigation: s/settings shows all settings; x exits and restarts stack only while not active."));
+  if (menuPage == MenuPage::FaultLog) {
+    Serial.println(F("Read-only page: type help to refresh the log; no changes are made here."));
+  } else {
+    Serial.println(F("Type help to repeat this submenu; values are saved immediately when accepted."));
+  }
   Serial.print(F("BMS CFG> "));
 }
 
@@ -497,7 +715,9 @@ bool commandAllowedInPage(MenuPage page, const char *command) {
     return commandEquals(command, "cv") || commandEquals(command, "hys") ||
            commandEquals(command, "imax") || commandEquals(command, "iend") ||
            commandEquals(command, "cap") || commandEquals(command, "series") ||
-           commandEquals(command, "charger");
+           commandEquals(command, "charger") ||
+           commandEquals(command, "chargerpath") ||
+           commandEquals(command, "chargercan");
   }
   if (page == MenuPage::SocEstimation) {
     return commandEquals(command, "soc") ||
@@ -511,8 +731,27 @@ bool commandAllowedInPage(MenuPage page, const char *command) {
     return commandEquals(command, "sensor") || commandEquals(command, "canrate") ||
            commandEquals(command, "canid") || commandEquals(command, "invert");
   }
-  if (page == MenuPage::Outputs) return commandEquals(command, "pin");
-  if (page == MenuPage::Monitor) return commandEquals(command, "p");
+  if (page == MenuPage::Outputs) {
+    return commandEquals(command, "pin") || commandEquals(command, "contactor");
+  }
+  if (page == MenuPage::IsolationMonitor) {
+    return commandEquals(command, "isolation") ||
+           commandEquals(command, "isolationtype") ||
+           commandEquals(command, "isolationpol") ||
+           commandEquals(command, "pin");
+  }
+  if (page == MenuPage::Monitor) {
+    return commandEquals(command, "p") || commandEquals(command, "temp");
+  }
+  if (page == MenuPage::Balancing) {
+    return commandEquals(command, "balance") ||
+           commandEquals(command, "bdelta") ||
+           commandEquals(command, "bhyst") ||
+           commandEquals(command, "bmin") ||
+           commandEquals(command, "bon") ||
+           commandEquals(command, "blevel") ||
+           commandEquals(command, "bcool");
+  }
   if (page == MenuPage::StateControl) {
     return commandEquals(command, "premin") ||
            commandEquals(command, "pretimeout") ||
@@ -599,8 +838,13 @@ void processCommand(char *command) {
   if (!length) return;
 
   if (commandEquals(command, "disarm")) {
+    const BmsStateStatus state = bmsStateMachineStatus();
+    if (state.state == BmsOperatingState::Drive) {
+      Serial.println(F("DISARM REFUSED in Drive. Remove the physical RUN request; the BMS keeps Drive outputs commanded until that controlled transition."));
+      return;
+    }
     bmsStateMachineDisarm(settingsGet());
-    Serial.println(F("DISARMED: mapped outputs commanded OFF; automatic control waits for Run and 240 V inputs to release."));
+    Serial.println(F("DISARMED: mapped outputs commanded OFF; automatic control waits for Run and all charge requests to release."));
     if (menuOpen) {
       Serial.println();
       printMenu();
@@ -620,11 +864,19 @@ void processCommand(char *command) {
   }
 
   if (commandEquals(command, "x") || commandEquals(command, "q")) {
-    bmsStateMachineDisarm(settingsGet());
+    const BmsOperatingState state = bmsStateMachineStatus().state;
+    const bool active = state == BmsOperatingState::Precharge ||
+        state == BmsOperatingState::Drive ||
+        state == BmsOperatingState::Charge;
+    if (!active) bmsStateMachineDisarm(settingsGet());
     menuOpen = false;
     menuPage = MenuPage::Main;
-    retryRequested = true;
-    Serial.println(F("Leaving configuration menu; reinitializing the BQ stack before live scanning."));
+    if (active) {
+      Serial.println(F("Leaving configuration menu without disarming or restarting the stack; the active state remains supervised."));
+    } else {
+      retryRequested = true;
+      Serial.println(F("Leaving configuration menu; reinitializing the BQ stack before live scanning."));
+    }
     return;
   }
   if (commandEquals(command, "help") || commandEquals(command, "h") ||
@@ -650,7 +902,15 @@ void processCommand(char *command) {
   }
   if (commandEquals(command, "r")) {
     if (menuPage != MenuPage::Monitor) {
-      Serial.println(F("Stack retry is in the Monitor submenu; use b, then 5."));
+      Serial.println(F("Stack retry is in the Monitor submenu; use b, then 6."));
+      Serial.print(F("BMS CFG> "));
+      return;
+    }
+    const BmsOperatingState state = bmsStateMachineStatus().state;
+    if (state == BmsOperatingState::Precharge ||
+        state == BmsOperatingState::Drive ||
+        state == BmsOperatingState::Charge) {
+      Serial.println(F("Manual stack retry is blocked during Precharge, Drive or Charge. Automatic recovery is used; do not interrupt an active power path."));
       Serial.print(F("BMS CFG> "));
       return;
     }
@@ -664,6 +924,14 @@ void processCommand(char *command) {
   if (commandEquals(command, "reboot")) {
     if (menuPage != MenuPage::Main) {
       Serial.println(F("Reboot is available from the main menu; use back first."));
+      Serial.print(F("BMS CFG> "));
+      return;
+    }
+    const BmsOperatingState state = bmsStateMachineStatus().state;
+    if (state == BmsOperatingState::Precharge ||
+        state == BmsOperatingState::Drive ||
+        state == BmsOperatingState::Charge) {
+      Serial.println(F("Reboot refused during an active power path. Remove RUN/charge request and return to an inactive state first."));
       Serial.print(F("BMS CFG> "));
       return;
     }
@@ -695,6 +963,12 @@ void processCommand(char *command) {
       menuPage = MenuPage::Monitor;
     else if (commandEquals(command, "7") || commandEquals(command, "state") ||
              commandEquals(command, "precharge")) menuPage = MenuPage::StateControl;
+    else if (commandEquals(command, "8") || commandEquals(command, "isolation") ||
+             commandEquals(command, "isolation-monitor")) menuPage = MenuPage::IsolationMonitor;
+    else if (commandEquals(command, "9") || commandEquals(command, "faults") ||
+             commandEquals(command, "faultlog")) menuPage = MenuPage::FaultLog;
+    else if (commandEquals(command, "10") || commandEquals(command, "balancing") ||
+             commandEquals(command, "balance")) menuPage = MenuPage::Balancing;
     else {
       Serial.println(F("Choose a numbered section from the main menu, or type s to show settings."));
       Serial.print(F("BMS CFG> "));
@@ -709,7 +983,7 @@ void processCommand(char *command) {
     const bool cleared = bmsStateMachineClearFault();
     Serial.println(cleared
         ? F("Fault cleared; outputs remain OFF and the controller waits for fresh interlocks.")
-        : F("Fault not cleared; ensure a fault is latched and both isolated inputs are inactive."));
+        : F("Fault not cleared; ensure Run/charge requests are inactive and a complete fresh stack scan has restored BQ communication."));
     Serial.println();
     printMenu();
     return;
@@ -764,6 +1038,55 @@ void processCommand(char *command) {
     printCommandResult(parsed && value <= 65535UL &&
                            settingsSetSamplePeriod(static_cast<uint16_t>(value)),
                        "Monitor period");
+  } else if (commandEquals(command, "temp")) {
+    unsigned long value = 0;
+    const bool parsed = parseUnsignedArgument(valueText, value);
+    printCommandResult(parsed && value <= 65535UL &&
+                           settingsSetTemperatureSamplePeriod(
+                               static_cast<uint16_t>(value)),
+                       "Temperature/GPIO poll period");
+  } else if (commandEquals(command, "balance")) {
+    const bool valid = valueText &&
+        (commandEquals(valueText, "on") || commandEquals(valueText, "off"));
+    const bool enabled = valueText && commandEquals(valueText, "on");
+    printCommandResult(valid && settingsSetCellBalancingEnabled(enabled),
+                       "Cell-balancing request");
+    if (valid && enabled) {
+      Serial.println(F("The request is saved, but the balancing hardware release gate is still LOCKED until resistor power rating/path are confirmed."));
+    }
+  } else if (commandEquals(command, "bdelta") ||
+             commandEquals(command, "bhyst") ||
+             commandEquals(command, "bmin") ||
+             commandEquals(command, "bon")) {
+    unsigned long value = 0;
+    const bool parsed = parseUnsignedArgument(valueText, value) &&
+                        value <= 65535UL;
+    bool accepted = false;
+    if (parsed && commandEquals(command, "bdelta")) {
+      accepted = settingsSetBalancingTargetDeltaMv(static_cast<uint16_t>(value));
+    } else if (parsed && commandEquals(command, "bhyst")) {
+      accepted = settingsSetBalancingHysteresisMv(static_cast<uint16_t>(value));
+    } else if (parsed && commandEquals(command, "bmin")) {
+      accepted = settingsSetBalancingMinCellMv(static_cast<uint16_t>(value));
+    } else if (parsed) {
+      accepted = settingsSetBalancingMaxOnSeconds(static_cast<uint16_t>(value));
+    }
+    printCommandResult(accepted, "Cell-balancing setting");
+  } else if (commandEquals(command, "blevel")) {
+    unsigned long value = 0;
+    const bool parsed = parseUnsignedArgument(valueText, value) && value <= 2UL;
+    printCommandResult(parsed &&
+                           settingsSetBalancingConservativeLevel(
+                               static_cast<uint8_t>(value)),
+                       "Balancing conservative level");
+  } else if (commandEquals(command, "bcool")) {
+    unsigned long value = 0;
+    const bool parsed = parseUnsignedArgument(valueText, value) &&
+                        value <= 3600UL;
+    printCommandResult(parsed &&
+                           settingsSetBalancingCoolOffMs(
+                               static_cast<uint32_t>(value) * 1000UL),
+                       "Balancing cool-off period");
   } else if (commandEquals(command, "ov") || commandEquals(command, "uv") ||
              commandEquals(command, "dv") || commandEquals(command, "dhy") ||
              commandEquals(command, "cv") || commandEquals(command, "hys")) {
@@ -807,11 +1130,35 @@ void processCommand(char *command) {
                        "SOC voltage-curve setting");
   } else if (commandEquals(command, "sensor")) {
     const bool valid = valueText &&
-        (commandEquals(valueText, "off") || commandEquals(valueText, "lem"));
-    const CurrentSensorType type =
-        valueText && commandEquals(valueText, "lem")
-            ? CurrentSensorType::LemCab500Can : CurrentSensorType::Off;
+        (commandEquals(valueText, "off") || commandEquals(valueText, "lem") ||
+         commandEquals(valueText, "sme"));
+    const CurrentSensorType type = !valueText || commandEquals(valueText, "off")
+        ? CurrentSensorType::Off
+        : (commandEquals(valueText, "lem") ? CurrentSensorType::LemCab500Can
+                                             : CurrentSensorType::SmePlaceholder);
     printCommandResult(valid && settingsSetCurrentSensorType(type), "Current sensor");
+    if (valid && type == CurrentSensorType::SmePlaceholder) {
+      Serial.println(F("SME selection saved as a placeholder only; current decoding and BMS interlock support are not implemented."));
+    }
+  } else if (commandEquals(command, "isolation")) {
+    const bool valid = valueText &&
+        (commandEquals(valueText, "on") || commandEquals(valueText, "off"));
+    const bool enabled = valueText && commandEquals(valueText, "on");
+    printCommandResult(valid && settingsSetIsolationMonitorEnabled(enabled),
+                       "Isolation-monitor option");
+    if (valid && enabled) {
+      Serial.println(F("Saved as enabled; because Bender/SME sensing is not implemented, the state machine remains disarmed."));
+    } else if (valid) {
+      Serial.println(F("Isolation-monitor option disabled; no isolation signal is currently being read."));
+    }
+  } else if (commandEquals(command, "isolationtype")) {
+    const bool valid = valueText &&
+        (commandEquals(valueText, "bender") || commandEquals(valueText, "sme"));
+    const IsolationMonitorType type = valueText && commandEquals(valueText, "sme")
+        ? IsolationMonitorType::SmePlaceholder : IsolationMonitorType::Bender;
+    printCommandResult(valid && settingsSetIsolationMonitorType(type),
+                       "Isolation-monitor source");
+    if (valid) Serial.println(F("Source selection is stored only; both monitor backends are not implemented."));
   } else if (commandEquals(command, "canrate")) {
     unsigned long value = 0;
     const bool parsed = parseUnsignedArgument(valueText, value);
@@ -850,7 +1197,59 @@ void processCommand(char *command) {
     const bool accepted = valid && valueText && settingsSetChargerType(type);
     printCommandResult(accepted, "Charger profile");
     if (accepted && type == ChargerType::Outlander) {
-      Serial.println(F("Outlander CAN TX remains disabled pending OBC/pack voltage compatibility."));
+      Serial.println(F("Shared CAN bus set to 500 kbit/s; Outlander CAN control is enabled."));
+    }
+  } else if (commandEquals(command, "chargercan")) {
+    const bool valid = valueText &&
+        (commandEquals(valueText, "on") || commandEquals(valueText, "off"));
+    const bool enabled = valueText && commandEquals(valueText, "on");
+    printCommandResult(valid && settingsSetChargerCanTx(enabled),
+                       "Outlander charger CAN transmit");
+    if (valid && enabled) {
+      Serial.println(F("Ready sends 0x285 wake frames; Charge sends 0x286 voltage/current requests."));
+    } else if (valid) {
+      Serial.println(F("Outlander CAN receive remains active; wake and charge commands are disabled."));
+    }
+  } else if (commandEquals(command, "chargerpath")) {
+    const bool valid = valueText &&
+        (commandEquals(valueText, "direct") || commandEquals(valueText, "behind"));
+    const bool behind = valueText && commandEquals(valueText, "behind");
+    printCommandResult(valid && settingsSetChargerBehindContactors(behind),
+                       "Charger connection path");
+    if (valid && behind) {
+      Serial.println(F("Charge requests now run the precharge sequence and close the main contactors before enabling charge."));
+    } else if (valid) {
+      Serial.println(F("Charge requests leave main contactors open; the charger is assumed wired directly to the pack."));
+    }
+  } else if (commandEquals(command, "contactor")) {
+    char *roleText = valueText;
+    while (roleText && *roleText && *roleText != ' ' && *roleText != '\t') ++roleText;
+    char *controlText = nullptr;
+    if (roleText && *roleText) {
+      *roleText++ = '\0';
+      while (*roleText == ' ' || *roleText == '\t') ++roleText;
+      controlText = roleText;
+    }
+    BmsOutputRole role = BmsOutputRole::MainPositive;
+    bool valid = valueText && controlText;
+    if (valueText && commandEquals(valueText, "mainneg")) {
+      role = BmsOutputRole::MainNegative;
+    } else if (valueText && commandEquals(valueText, "precharge")) {
+      role = BmsOutputRole::Precharge;
+    } else {
+      valid = false;
+    }
+    const bool controlValid = controlText &&
+        (commandEquals(controlText, "fet") || commandEquals(controlText, "sme"));
+    const ContactorControlType control = controlText &&
+        commandEquals(controlText, "sme")
+            ? ContactorControlType::SmePlaceholder
+            : ContactorControlType::NanoLowSideFet;
+    const bool accepted = valid && controlValid &&
+        settingsSetContactorControlType(role, control);
+    printCommandResult(accepted, "Contactor controller");
+    if (accepted && control == ContactorControlType::SmePlaceholder) {
+      Serial.println(F("SME placeholder saved; any mapped FET gate is held LOW and Drive/behind-contactor Charge remain inhibited."));
     }
   } else if (commandEquals(command, "pin")) {
     bool valid = valueText != nullptr;
@@ -877,11 +1276,15 @@ void processCommand(char *command) {
     } else if (valueText && commandEquals(valueText, "charge")) {
       inputRole = true;
       inputName = "chargepin";
+    } else if (valueText && commandEquals(valueText, "isolation")) {
+      inputRole = true;
+      inputName = "isolationpin";
     } else valid = false;
 
     uint8_t pin = 0xFFU;
     unsigned long numericPin = 0;
-    if (pinValue && commandEquals(pinValue, "none") && !inputRole) pin = 0xFFU;
+    if (pinValue && commandEquals(pinValue, "none") &&
+        (!inputRole || (inputName && strcmp(inputName, "isolationpin") == 0))) pin = 0xFFU;
     else if (pinValue && commandEquals(pinValue, "none")) valid = false;
     else if (!parseUnsignedArgument(pinValue, numericPin) || numericPin > 255UL) valid = false;
     else pin = static_cast<uint8_t>(numericPin);
@@ -904,6 +1307,13 @@ void processCommand(char *command) {
     const bool activeHigh = valueText && commandEquals(valueText, "high");
     printCommandResult(valid && settingsSetInputPolarity(command, activeHigh),
                        "Input active level");
+  } else if (commandEquals(command, "isolationpol")) {
+    const bool valid = valueText &&
+        (commandEquals(valueText, "high") || commandEquals(valueText, "low"));
+    const bool activeHigh = valueText && commandEquals(valueText, "high");
+    printCommandResult(valid && settingsSetIsolationMonitorPolarity(activeHigh),
+                       "Isolation fault active level");
+    if (valid) Serial.println(F("Polarity is stored only and is unused until a monitor backend is implemented."));
   }
   else {
     Serial.println(F("Unknown menu command or missing value; enter h for help."));
@@ -928,8 +1338,20 @@ void serialConsolePrintStartup() {
   Serial.print(F("Configuration storage: "));
   Serial.println(settingsAreStored() ? F("Nano R4 EEPROM settings verified.")
                                     : F("EEPROM unavailable or record invalid; defaults are active."));
-  Serial.println(F("Contactor state machine starts disarmed and waits for valid stack/current interlocks."));
-  Serial.println(F("Run and 240 V isolated inputs request operation; Outlander charger CAN TX remains disabled."));
+  Serial.print(F("Persistent fault log: "));
+  Serial.println(faultLogAvailable() ? F("ready; view it in menu 9.")
+                                    : F("unavailable; EEPROM region check failed."));
+  const BmsStateStatus initialState = bmsStateMachineStatus();
+  Serial.print(F("BMS state at startup: "));
+  Serial.println(bmsOperatingStateName(initialState.state));
+  if (initialState.state == BmsOperatingState::Fault) {
+    Serial.println(F("Saved communication lockouts auto-clear after 3 complete scans with Run/charge inactive; other faults require CLEARFAULT."));
+  } else {
+    Serial.println(F("Outputs start OFF and arming waits for valid stack/current interlocks."));
+  }
+  Serial.print(F("Run requests Drive; isolated 240 V or Outlander mains requests Charge; OBC CAN TX="));
+  Serial.println(settingsGet().chargerTxEnabled ? F("enabled (wake in Disarmed/Ready).")
+                                                : F("disabled by configuration."));
 }
 
 void serialConsolePrintInitResult(bool ok, const char *error) {
@@ -943,7 +1365,47 @@ void serialConsolePrintInitResult(bool ok, const char *error) {
   }
 }
 
+void serialConsoleServiceOutput() {
+  if (displaySendPending) {
+    const int writable = Serial.availableForWrite();
+    if (writable > 0) {
+      size_t chunk = static_cast<size_t>(writable);
+      const size_t remaining = displaySendLength - displaySendOffset;
+      if (chunk > remaining) chunk = remaining;
+      if (chunk > 64U) chunk = 64U;
+      if (chunk) {
+        const size_t written = Serial.write(
+            reinterpret_cast<const uint8_t *>(displayBuffer + displaySendOffset),
+            chunk);
+        displaySendOffset += written;
+      }
+    }
+    if (displaySendOffset >= displaySendLength) {
+      displaySendPending = false;
+      displaySendLength = 0;
+      displaySendOffset = 0;
+    }
+  }
+
+  // Status changes still update stackStatusText while a menu is open, but do
+  // not emit a free-running line that would scroll the user's menu. The next
+  // live snapshot includes the current stack status after the menu closes.
+  if (menuOpen) {
+    stackStatusNotificationPending = false;
+  } else if (!displaySendPending && stackStatusNotificationPending) {
+    Serial.print(F("\nSTACK LINK: "));
+    Serial.println(stackStatusText);
+    stackStatusNotificationPending = false;
+  }
+
+  if (!displaySendPending && deferredCommandPending) {
+    deferredCommandPending = false;
+    processCommand(deferredCommandBuffer);
+  }
+}
+
 void serialConsolePollInput() {
+  if (deferredCommandPending) return;
   while (Serial.available()) {
     const int incoming = Serial.read();
     if (incoming < 0) break;
@@ -951,8 +1413,14 @@ void serialConsolePollInput() {
     if (value == '\r') continue;
     if (value == '\n') {
       commandBuffer[commandLength] = '\0';
-      processCommand(commandBuffer);
+      if (displaySendPending) {
+        memcpy(deferredCommandBuffer, commandBuffer, commandLength + 1U);
+        deferredCommandPending = true;
+      } else {
+        processCommand(commandBuffer);
+      }
       commandLength = 0;
+      if (deferredCommandPending) return;
       continue;
     }
     if (commandLength + 1U < COMMAND_BUFFER_SIZE) {
@@ -971,14 +1439,22 @@ bool serialConsoleTakeRetryRequest() {
   return requested;
 }
 
+void serialConsoleSetStackStatus(const char *statusTextValue) {
+  snprintf(stackStatusText, sizeof(stackStatusText), "%s",
+           statusTextValue ? statusTextValue : "UNKNOWN");
+  stackStatusNotificationPending = true;
+}
+
 void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
                                 const BmsSettings &settings,
                                 const CurrentSensorStatus &current,
                                 const BatteryLimitStatus &limits,
                                 const BmsStateStatus &state,
+                                const OutlanderChargerStatus &charger,
                                 const SocStatus &soc) {
-  // Assemble the complete frame in RAM and emit once, avoiding partial rows
-  // and keeping the live table's columns aligned as values change.
+  // Assemble the complete frame in RAM, then let the main loop drain it in
+  // small chunks so display output cannot monopolize CAN/UART service.
+  if (displaySendPending) return;
   size_t length = 0;
   bool ok = true;
   displayBuffer[0] = '\0';
@@ -993,25 +1469,28 @@ void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
                  DISPLAY_FRAME_WIDTH);
   appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
   appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
-               "TIME:%5lu s  SCAN:%4lu ms  TARGET:%4u ms  CELLS:%3u/%u  CELL:%s  GPIO:%s\n",
+               "TIME:%5lu s  SCAN:%4lu ms  TARGET:%4u ms  TEMP:%5u ms  CELLS:%3u/%u  CELL:%s  GPIO:%s\n",
                static_cast<unsigned long>(snapshot.finishedAtMs / 1000UL),
                static_cast<unsigned long>(snapshot.durationMs),
                static_cast<unsigned>(settings.samplePeriodMs),
+               static_cast<unsigned>(settings.temperatureSamplePeriodMs),
                static_cast<unsigned>(snapshot.validCellCount),
                static_cast<unsigned>(static_cast<uint16_t>(snapshot.moduleCount) * BATTERY_CELLS_PER_MODULE),
                snapshot.allCellReadsOk ? "OK" : "PARTIAL",
                snapshot.allGpioReadsOk ? "OK" : "PARTIAL");
+  appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+               "STACK LINK: %s\n", stackStatusText);
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, "ADDR   |");
   for (uint8_t cell = 1; cell <= BATTERY_CELLS_PER_MODULE; ++cell) {
-    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "C%02u     ",
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "C%02u      ",
                  static_cast<unsigned>(cell));
   }
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
              "| MIN     MAX     DELTA_mV T_EST_C / NTC\n"
              "--------+");
-  appendRepeated(displayBuffer, sizeof(displayBuffer), length, ok, '-', 96);
+  appendRepeated(displayBuffer, sizeof(displayBuffer), length, ok, '-', 108);
   appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '+');
-  appendRepeated(displayBuffer, sizeof(displayBuffer), length, ok, '-', 40);
+  appendRepeated(displayBuffer, sizeof(displayBuffer), length, ok, '-', 63);
   appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
 
   float packMin = 1000000.0f;
@@ -1028,7 +1507,7 @@ void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
     for (uint8_t cell = 0; cell < BATTERY_CELLS_PER_MODULE; ++cell) {
       appendCellValue(displayBuffer, sizeof(displayBuffer), length, ok,
                       module, cell);
-      appendText(displayBuffer, sizeof(displayBuffer), length, ok, "   ");
+      appendText(displayBuffer, sizeof(displayBuffer), length, ok, "    ");
     }
     appendText(displayBuffer, sizeof(displayBuffer), length, ok, "| ");
 
@@ -1072,15 +1551,16 @@ void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
       appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
                   temperatureSum / temperatureCount, 1, 5);
       appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
-                   "C NTC=%u", static_cast<unsigned>(temperatureCount));
+                   "C%s NTC=%u", module.gpioDataFresh ? "" : "~",
+                   static_cast<unsigned>(temperatureCount));
     } else {
       appendText(displayBuffer, sizeof(displayBuffer), length, ok,
                  "  ---C NTC=0");
     }
     appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
 
-    appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-               "     ADC mV | ");
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+                 "     ADC%s mV | ", module.gpioDataFresh ? "" : "~");
     for (uint8_t gpio = 0; gpio < BATTERY_GPIO_COUNT; ++gpio) {
       const uint8_t bit = static_cast<uint8_t>(1U << gpio);
       appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "G%u=",
@@ -1104,84 +1584,61 @@ void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
     }
   }
 
+  appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "PACK: ");
   if (packMinAddress && packMaxAddress) {
-    appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-               "PACK RANGE: ");
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "LOW=");
     appendVoltage(displayBuffer, sizeof(displayBuffer), length, ok, packMin);
     appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
-                 "V @%u/C%02u  to  ", static_cast<unsigned>(packMinAddress),
+                 "V @%u/C%02u | HIGH=", static_cast<unsigned>(packMinAddress),
                  static_cast<unsigned>(packMinCell));
     appendVoltage(displayBuffer, sizeof(displayBuffer), length, ok, packMax);
     appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
-                 "V @%u/C%02u  Δ", static_cast<unsigned>(packMaxAddress),
+                 "V @%u/C%02u | DELTA=", static_cast<unsigned>(packMaxAddress),
                  static_cast<unsigned>(packMaxCell));
     appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
                 packMax - packMin, 1, 5);
-    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "mV\n");
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "mV");
+  } else {
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "no valid cells");
   }
-
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "LIMITS: DATA=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | DATA=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
              limits.readingsValid ? "VALID" : "INVALID");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " LOW=");
-  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
-              limits.lowestCellV, 3, 6);
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "V HIGH=");
-  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
-              limits.highestCellV, 3, 6);
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "V OV=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " OV=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             limits.overVoltage ? "YES" : "NO ");
+             limits.overVoltage ? "YES" : "NO");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, " UV=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             limits.underVoltage ? "YES" : "NO ");
+             limits.underVoltage ? "YES" : "NO");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, " DISCHARGE=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             limits.dischargeBlocked ? "BLOCKED" : "READY  ");
-  appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
-
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             "CHARGE: CELL_TARGET=");
-  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
-              settings.chargeVoltageV, 3, 6);
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "V PACK_TARGET=");
-  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
-              limits.packChargeTargetV, 1, 7);
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "V FOR ");
-  appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "%uS  I_REQUEST=",
-               static_cast<unsigned>(settings.seriesCells));
+             limits.dischargeBlocked ? "BLOCKED" : "READY");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " CHG_I=");
   appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
               limits.chargeCurrentRequestA, 1, 6);
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, "A PAUSED=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             limits.chargePausedByHysteresis ? "YES" : "NO ");
-  appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
+             limits.chargePausedByHysteresis ? "YES\n" : "NO\n");
 
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "CURRENT: ");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             currentSensorName(settings.currentSensor));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " CAN=");
+             "\nCURRENT: CAN=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
              current.canReady ? "READY" : "OFF/ERR");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " DATA=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | DATA=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
              current.valid ? "FRESH" : (current.frameSeen ? "STALE/FAULT" : "NONE"));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " I=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | I=");
   if (current.valid) {
     appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
                 current.currentMilliamp / 1000.0f, 2, 8);
   } else {
     appendText(displayBuffer, sizeof(displayBuffer), length, ok, "     ---");
   }
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "A ERR=");
   appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
-               "%3u FRAMES=%lu\n", static_cast<unsigned>(current.errorCode),
+               "A | ERR=%u | FRAMES=%lu | SOC=",
+               static_cast<unsigned>(current.errorCode),
                static_cast<unsigned long>(current.frameCount));
-
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "SOC: MODE=");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             settings.socMode == SocMode::CoulombCount ? "COULOMB" : "VOLTAGE");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " VALUE=");
   if (soc.initialized) appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
                                    soc.percent, 2, 6);
   else appendText(displayBuffer, sizeof(displayBuffer), length, ok, "   ---");
@@ -1190,71 +1647,125 @@ void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
                                    soc.remainingAh, 2, 7);
   else appendText(displayBuffer, sizeof(displayBuffer), length, ok, "    ---");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, "Ah IN=");
-  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok, soc.chargedAh, 2, 9);
+  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok, soc.chargedAh, 2, 8);
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, "Ah OUT=");
-  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok, soc.dischargedAh, 2, 9);
+  appendFixed(displayBuffer, sizeof(displayBuffer), length, ok, soc.dischargedAh, 2, 8);
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, "Ah SAVE=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             soc.pendingSave ? "PEND\n" : (soc.stateStored ? "OK\n" : "NONE\n"));
+             soc.pendingSave ? "PENDING\n" : (soc.stateStored ? "OK\n" : "NONE\n"));
 
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "BMS: STATE=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+             "\nBMS: STATE=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
              bmsOperatingStateName(state.state));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " ARMED=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | ARMED=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             state.armed ? "YES" : "NO ");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " RUN=");
+             state.armed ? "YES" : "NO");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | STACK_FAULT=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             state.runRequested ? "ON " : "OFF");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " 240V=");
+             state.stackCommunicationFault ? "YES" : "NO");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | RUN=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             state.chargeRequested ? "ON " : "OFF");
+             state.runRequested ? "ON" : "OFF");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | 240V=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+             state.chargeInputActive ? "ON" : "OFF");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | OBC_AC=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+             state.chargerMainsDetected ? "YES" : "NO");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | CHG_REQ=");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+             state.chargeRequested ? "YES" : "NO");
   appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
-               " PRE=%lu ms\n", static_cast<unsigned long>(state.prechargeElapsedMs));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "STATE DETAIL: ");
+               " | PRE=%lu ms | OUT+=",
+               static_cast<unsigned long>(state.prechargeElapsedMs));
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             state.reason ? state.reason : "-");
-  appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
-
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, "CHARGER: ");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             chargerName(settings.chargerType));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " CAN_TX=");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             settings.chargerTxEnabled ? "ENABLED" : "DISABLED");
+             bmsOutputIsActive(BmsOutputRole::MainPositive) ? "ON" : "OFF");
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " MAIN-=");
+  if (settings.mainNegativeControl == ContactorControlType::SmePlaceholder) {
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "N/A");
+  } else {
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+               bmsOutputIsActive(BmsOutputRole::MainNegative) ? "ON" : "OFF");
+  }
+  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " PRE_OUT=");
+  if (settings.prechargeControl == ContactorControlType::SmePlaceholder) {
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "N/A");
+  } else {
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+               bmsOutputIsActive(BmsOutputRole::Precharge) ? "ON" : "OFF");
+  }
   appendText(displayBuffer, sizeof(displayBuffer), length, ok, " RELAY=");
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             chargerRelayIsOn() ? "ON " : "OFF");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " PIN=");
-  if (settings.chargerRelayPin == 0xFFU) {
-    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "UNASSIGNED");
-  } else {
-    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "D%u",
-                 static_cast<unsigned>(settings.chargerRelayPin));
+             chargerRelayIsOn() ? "ON\n" : "OFF\n");
+  appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+               "BALANCE: %s | DELTA=%u+%u mV | MIN=%u mV | PULSE=%u s / COOL=%lu s\n",
+               batteryCommsBalanceStatus(),
+               static_cast<unsigned>(settings.balancingTargetDeltaMv),
+               static_cast<unsigned>(settings.balancingHysteresisMv),
+               static_cast<unsigned>(settings.balancingMinCellMv),
+               static_cast<unsigned>(settings.balancingMaxOnSeconds),
+               static_cast<unsigned long>(settings.balancingCoolOffMs / 1000UL));
+  if ((state.state == BmsOperatingState::Fault || state.stackCommunicationFault) &&
+      state.reason && state.reason[0]) {
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+                 "  DETAIL: %s\n", state.reason);
   }
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             " ACTIVE_HIGH; STATE_MACHINE_DRIVEN\n");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             "OUTPUTS: MAIN+=");
-  if (settings.mainPositivePin == 0xFFU) appendText(displayBuffer, sizeof(displayBuffer), length, ok, "---");
-  else appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "D%u", static_cast<unsigned>(settings.mainPositivePin));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             bmsOutputIsActive(BmsOutputRole::MainPositive) ? " ON " : " OFF");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " MAIN-=");
-  if (settings.mainNegativePin == 0xFFU) appendText(displayBuffer, sizeof(displayBuffer), length, ok, "---");
-  else appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "D%u", static_cast<unsigned>(settings.mainNegativePin));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             bmsOutputIsActive(BmsOutputRole::MainNegative) ? " ON " : " OFF");
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok, " PRECHARGE=");
-  if (settings.prechargePin == 0xFFU) appendText(displayBuffer, sizeof(displayBuffer), length, ok, "---");
-  else appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "D%u", static_cast<unsigned>(settings.prechargePin));
-  appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             bmsOutputIsActive(BmsOutputRole::Precharge) ? " ON\n" : " OFF\n");
+
+  if (settings.chargerType == ChargerType::Outlander) {
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+                 "\nCHARGER: CAN=%s | RX389=%s | RX38A=%s | PLUG=%s | CHG=%s | ERR=%s | READY=%s | WAIT_AC=%s",
+                 charger.canBusReady ? "up" : "down",
+                 charger.charger389Fresh ? "OK" : "STALE",
+                 charger.charger38AFresh ? "OK" : "STALE",
+                 charger.mainsPresent ? "yes" : "no",
+                 charger.charging ? "YES" : "no",
+                 charger.chargerError ? "YES" : "no",
+                 charger.readyForCharge ? "YES" : "no",
+                 charger.waitForMains ? "YES" : "no");
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | TX=");
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok,
+               charger.lastTxMode == 1U ? "WAKE" :
+                   (charger.lastTxMode == 2U ? "SET" :
+                    (charger.lastTxMode == 3U ? "STOP" : "---")));
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, " | AGE=");
+    if (charger.lastFrameAgeMs == 0xFFFFFFFFUL) {
+      appendText(displayBuffer, sizeof(displayBuffer), length, ok, "---");
+    } else {
+      appendFormat(displayBuffer, sizeof(displayBuffer), length, ok, "%lu ms",
+                   static_cast<unsigned long>(charger.lastFrameAgeMs));
+    }
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+                 " | RX=%lu TX=%lu BUSY=%lu\n",
+                 static_cast<unsigned long>(charger.frameCount),
+                 static_cast<unsigned long>(charger.txFrameCount),
+                 static_cast<unsigned long>(charger.txBusyCount));
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "OBC: HV=");
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+                 "%uV AC=%uV DC1=", static_cast<unsigned>(charger.hvBatteryVoltageV),
+                 static_cast<unsigned>(charger.acMainsVoltageV));
+    appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
+                charger.dcChargeCurrentA, 1, 5);
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "A DC2=");
+    appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
+                charger.dcChargeCurrent2A, 1, 5);
+    appendText(displayBuffer, sizeof(displayBuffer), length, ok, "A AC_I=");
+    appendFixed(displayBuffer, sizeof(displayBuffer), length, ok,
+                charger.acMainsCurrentA, 1, 5);
+    appendFormat(displayBuffer, sizeof(displayBuffer), length, ok,
+                 "A BUS=%uV EVSE=%u%% TEMP=%d/%d/%d/%dC STATUS=%02X/%02X\n",
+                 static_cast<unsigned>(charger.dcBusVoltageV),
+                 static_cast<unsigned>(charger.evsePilotPercent),
+                 static_cast<int>(charger.chargerTemp1C),
+                 static_cast<int>(charger.chargerTemp2C),
+                 static_cast<int>(charger.chargerTemp3C),
+                 static_cast<int>(charger.chargerTemp4C),
+                 static_cast<unsigned>(charger.status389),
+                 static_cast<unsigned>(charger.status38A));
+  }
 
   appendText(displayBuffer, sizeof(displayBuffer), length, ok,
-             "For configuration menu type HELP and press Enter.\n"
-             "T_EST uses provisional 22k/10k/B3380 assumptions; ADC row shows raw GPIO millivolts.\n"
-             "");
+             "\n~ marks retained GPIO/temp data between slower polls. HELP = menu | item 9 = fault log | item 10 = balancing\n");
   appendRepeated(displayBuffer, sizeof(displayBuffer), length, ok, '=',
                  DISPLAY_FRAME_WIDTH);
   appendChar(displayBuffer, sizeof(displayBuffer), length, ok, '\n');
@@ -1263,5 +1774,8 @@ void serialConsolePrintSnapshot(const BatterySnapshot &snapshot,
     Serial.println(F("Display frame exceeded its buffer; no partial frame was sent."));
     return;
   }
-  Serial.write(reinterpret_cast<const uint8_t *>(displayBuffer), length);
+  displaySendLength = length;
+  displaySendOffset = 0;
+  displaySendPending = length != 0;
+  if (displaySendPending) stackStatusNotificationPending = false;
 }

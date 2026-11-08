@@ -17,6 +17,8 @@ struct ModuleReading {
   // Read success and validity counts are independent for cell and GPIO ADCs.
   bool cellReadOk;
   bool gpioReadOk;
+  // True only on a pass that actually refreshed GPIO/temperature ADC data.
+  bool gpioDataFresh;
   uint8_t validCellCount;
   uint8_t adcGpioMask;
   uint8_t validGpioMask;
@@ -59,14 +61,28 @@ enum class BatteryScanStepResult : uint8_t {
 // responses. Returns false and fills error when any startup check fails.
 bool batteryCommsBegin(const BmsSettings &settings, char *error,
                        size_t errorSize);
+// Let synchronous BQ startup transactions service time-sensitive host work
+// (notably CAN RX) while their UART waits and wake delays run.
+void batteryCommsSetBackgroundService(void (*service)());
 bool batteryCommsIsReady();
 const char *batteryCommsLastError();
 
-// Start one full pass, then call batteryCommsScanStep() until Complete or
-// NotReady. Each step performs no more than one module's ADC reads.
+// Start one full pass, then call batteryCommsScanStep() on every loop pass
+// until Complete or NotReady. Each call starts/services at most one UART
+// transaction and returns while a response or ADC conversion is pending.
 void batteryCommsStartScan(BatterySnapshot &snapshot,
                            const BmsSettings &settings);
 BatteryScanStepResult batteryCommsScanStep(BatterySnapshot &snapshot,
                                            const BmsSettings &settings);
 // Abort an in-progress pass before reinitializing the stack.
 void batteryCommsCancelScan();
+
+// Cell-balancing policy uses only complete cell scans. The hardware-release
+// interlock in batterycomms.cpp currently prevents all balancing register
+// writes until the board's resistor wattage/topology has been confirmed.
+void batteryCommsBalanceObserveScan(const BatterySnapshot &snapshot,
+                                    const BmsSettings &settings);
+void batteryCommsBalanceService(const BmsSettings &settings, bool permitted);
+bool batteryCommsBalanceBusy();
+bool batteryCommsBalanceIsActive();
+const char *batteryCommsBalanceStatus();

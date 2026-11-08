@@ -20,7 +20,7 @@
     module temperatures every 500 ms, and read current from the external LEM.
   - Cell-voltage delta and charge/discharge-current calculations, SOC, charger
     control over CAN, and a wide, readable USB serial status display.
-  - Retain the SOC calculation and serial-configurable settings from Jamie's
+  - Retain the SOC calculation and serial-configurable settings from Tom_EVnut's
     Simp BMS after review and adaptation. Do not carry forward its legacy
     Victron, Tesla, BMW/Mini CAN protocols, or old CSC control/CRC handling.
   - Use the user's modified Nano R4 R7FA4M1_CAN library for CAN, including its

@@ -19,9 +19,14 @@ struct CurrentSensorStatus {
   uint32_t invalidFrameCount;
 };
 
-// Initialize or reconfigure the CAN controller from the current settings.
+// Initialize or reconfigure the shared LEM/charger CAN controller.
 void batteryCanBegin(const BmsSettings &settings);
 // Drain available CAN frames; call frequently from loop() to avoid backlog.
 void batteryCanPoll(const BmsSettings &settings);
 // Return current sensor status with stale-frame and sign settings applied.
 CurrentSensorStatus batteryCanCurrent(const BmsSettings &settings);
+// The LEM sensor and Outlander OBC share the Nano's single 500 kbit/s CAN bus.
+bool batteryCanBusReady();
+// Queue one standard data frame only when the CAN transmit mailbox is free.
+bool batteryCanSendStandardFrame(uint16_t id, const uint8_t *data,
+                                 uint8_t length);

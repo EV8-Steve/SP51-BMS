@@ -1,9 +1,9 @@
 /*
   Adapter for the optional external charger relay output.
 
-  The relay is only accepted when ChargerType::ExternalRelay is selected. This
-  does not implement the Outlander OBC CAN protocol; charger CAN transmit is
-  deliberately disabled in the current build.
+  The relay is only accepted when ChargerType::ExternalRelay is selected.
+  Outlander OBC CAN control lives in outlander_charger.cpp and does not use this
+  mapped relay output.
 */
 #include "charger_relay.h"
 
